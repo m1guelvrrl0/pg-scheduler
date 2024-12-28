@@ -1,6 +1,6 @@
 # Python Job Scheduler
 
-A simple async job scheduler for Python that allows you to schedule and manage the execution of asynchronous tasks.
+A simple lightweight async first job scheduler for Python that allows you to schedule and manage the execution of asynchronous tasks.
 
 ## Features
 
