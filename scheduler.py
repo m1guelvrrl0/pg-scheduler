@@ -95,7 +95,7 @@ class Scheduler:
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully"""
         logger.info(f"Received signal {signum}, initiating graceful shutdown...")
-        asyncio.create_task(self.stop())
+        asyncio.create_task(self.shutdown())
 
     async def start(self):
         """Start the scheduler with reliability features"""
@@ -126,8 +126,8 @@ class Scheduler:
             await self._cleanup_background_tasks()
             raise
 
-    async def stop(self):
-        """Stop the scheduler gracefully with job completion"""
+    async def shutdown(self):
+        """Shutdown the scheduler gracefully with job completion"""
         if not self.is_running or self.is_shutting_down:
             return
 

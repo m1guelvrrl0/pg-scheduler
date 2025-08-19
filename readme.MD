@@ -109,7 +109,7 @@ async def main():
         
     finally:
         # Clean shutdown
-        await scheduler.stop()
+        await scheduler.shutdown()
         await db_pool.close()
 
 if __name__ == "__main__":
