@@ -62,7 +62,7 @@ class Scheduler:
         # Concurrency control with tracking
         self.job_semaphore = asyncio.Semaphore(max_concurrent_jobs)
         self.max_concurrent_jobs = max_concurrent_jobs
-        self.active_jobs: Set[int] = set()  # Track active job IDs
+        self.active_jobs: Set[str] = set()  # Track active job IDs
         
         # Job expiration policy
         self.misfire_grace_time = misfire_grace_time
@@ -180,7 +180,7 @@ class Scheduler:
         """Initialize database with worker tracking and reliability features"""
         await self._execute_with_retry("""
             CREATE TABLE IF NOT EXISTS scheduled_jobs (
-                job_id SERIAL PRIMARY KEY,
+                job_id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
                 job_name TEXT NOT NULL,
                 execution_time TIMESTAMPTZ NOT NULL,
                 status TEXT DEFAULT 'pending',
@@ -189,7 +189,7 @@ class Scheduler:
                 last_heartbeat TIMESTAMPTZ,
                 priority INTEGER DEFAULT 5,
                 retry_count INTEGER DEFAULT 0,
-                max_retries INTEGER DEFAULT 3,
+                max_retries INTEGER DEFAULT 0,
                 worker_id TEXT,  -- Track which worker is processing
                 error_message TEXT -- Track last error for debugging
             );
@@ -291,8 +291,9 @@ class Scheduler:
         args: tuple = (),
         kwargs: dict = None,
         priority: JobPriority = JobPriority.NORMAL,
-        max_retries: int = 3
-    ):
+        max_retries: int = 0,
+        job_id: Optional[str] = None
+    ) -> str:
         """
         Schedule an async I/O function to run at a specific time.
         
@@ -303,6 +304,10 @@ class Scheduler:
             kwargs: Dictionary of keyword arguments to pass to the function
             priority: Job priority using JobPriority enum (NORMAL or CRITICAL)
             max_retries: Maximum retry attempts for failed jobs
+            job_id: Optional custom job ID (auto-generated if not provided)
+            
+        Returns:
+            str: The job ID of the scheduled job
         """
         if not inspect.iscoroutinefunction(func):
             raise TypeError(f"Expected an async function, got {type(func)}")
@@ -317,15 +322,17 @@ class Scheduler:
         }
         
         # Schedule the job in the database
-        await self.schedule_job(
+        scheduled_job_id = await self.schedule_job(
             func.__name__, 
             execution_time, 
             task_data, 
             priority=priority,
-            max_retries=max_retries
+            max_retries=max_retries,
+            job_id=job_id
         )
         
-        logger.info(f"Scheduled async function {func.__name__} to run at {execution_time} (priority={priority.value})")
+        logger.info(f"Scheduled async function {func.__name__} to run at {execution_time} (priority={priority.value}, job_id={scheduled_job_id})")
+        return scheduled_job_id
 
     async def listen_for_jobs(self):
         """Listen for jobs with enhanced reliability"""
@@ -463,7 +470,7 @@ class Scheduler:
             
             # Add timeout to prevent runaway jobs
             try:
-                result = await asyncio.wait_for(
+                await asyncio.wait_for(
                     task_func(*args, **kwargs),
                     timeout=3600  # 1 hour max per job
                 )
@@ -493,7 +500,7 @@ class Scheduler:
         """Handle job failure with proper retry logic"""
         job_id = job_row['job_id']
         retry_count = job_row.get('retry_count', 0)
-        max_retries = job_row.get('max_retries', 3)
+        max_retries = job_row.get('max_retries', 0)
         
         if retry_count < max_retries:
             # Schedule retry with exponential backoff
@@ -620,7 +627,7 @@ class Scheduler:
                 logger.error(f"Heartbeat failed for job {job_id}: {e}")
                 await asyncio.sleep(30)
 
-    async def schedule_job(self, job_name, execution_time, task_data, priority: JobPriority = JobPriority.NORMAL, max_retries: int = 3):
+    async def schedule_job(self, job_name, execution_time, task_data, priority: JobPriority = JobPriority.NORMAL, max_retries: int = 0, job_id: Optional[str] = None) -> str:
         """
         Schedule a job by inserting it into the 'scheduled_jobs' table.
         
@@ -630,15 +637,67 @@ class Scheduler:
             task_data (dict): Additional data required for the job execution.
             priority: Job priority using JobPriority enum (NORMAL or CRITICAL)
             max_retries: Maximum retry attempts for failed jobs
+            job_id: Optional custom job ID (auto-generated if not provided)
+            
+        Returns:
+            str: The job ID of the scheduled job
         """
         json_task_data = json.dumps(task_data)
         
-        await self._execute_with_retry("""
-            INSERT INTO scheduled_jobs (job_name, execution_time, status, task_data, priority, max_retries)
-            VALUES ($1, $2, 'pending', $3::jsonb, $4, $5);
-        """, job_name, execution_time, json_task_data, priority.db_value, max_retries)
+        if job_id is not None:
+            # Insert with custom job_id
+            result = await self._execute_with_retry("""
+                INSERT INTO scheduled_jobs (job_id, job_name, execution_time, status, task_data, priority, max_retries)
+                VALUES ($1, $2, $3, 'pending', $4::jsonb, $5, $6)
+                RETURNING job_id;
+            """, job_id, job_name, execution_time, json_task_data, priority.db_value, max_retries)
+        else:
+            # Let database auto-generate job_id
+            result = await self._execute_with_retry("""
+                INSERT INTO scheduled_jobs (job_name, execution_time, status, task_data, priority, max_retries)
+                VALUES ($1, $2, 'pending', $3::jsonb, $4, $5)
+                RETURNING job_id;
+            """, job_name, execution_time, json_task_data, priority.db_value, max_retries)
         
-        logger.info(f"Job scheduled: {job_name} at {execution_time} (priority={priority.value})")
+        scheduled_job_id = result[0]['job_id']
+        logger.info(f"Job scheduled: {job_name} at {execution_time} (priority={priority.value}, job_id={scheduled_job_id})")
+        return scheduled_job_id
+
+    async def cancel_job(self, job_id: str) -> bool:
+        """
+        Cancel a scheduled job by setting its status to 'cancelled'.
+        
+        Args:
+            job_id (str): The ID of the job to cancel
+            
+        Returns:
+            bool: True if the job was successfully cancelled, False otherwise
+        """
+        try:
+            result = await self._execute_with_retry("""
+                UPDATE scheduled_jobs 
+                SET status = 'cancelled', 
+                    worker_id = NULL,
+                    last_heartbeat = NULL
+                WHERE job_id = $1 
+                AND status IN ('pending', 'running')
+                RETURNING job_id, job_name, status;
+            """, job_id)
+            
+            if result:
+                cancelled_job = result[0]
+                logger.info(f"Job cancelled: {cancelled_job['job_name']} (job_id={job_id})")
+                
+                # Remove from active jobs if it was running
+                self.active_jobs.discard(job_id)
+                return True
+            else:
+                logger.warning(f"Job {job_id} could not be cancelled (may not exist or already completed)")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error cancelling job {job_id}: {e}")
+            return False
 
     async def update_job_status(self, job_id, status):
         """
