@@ -3,9 +3,14 @@ import datetime
 import json
 import asyncpg
 import logging
+import signal
+import sys
 from job import Job, JobStatus
 import inspect
 from datetime import UTC
+from typing import Optional, Set
+from enum import Enum
+import uuid
 
 logging.basicConfig(
     level=logging.INFO,
@@ -13,130 +18,270 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+class JobPriority(Enum):
+    """User-friendly job priority levels"""
+    NORMAL = "normal"      # Default priority (value: 5)
+    CRITICAL = "critical"  # High priority (value: 1) - lower numbers = higher priority
+    
+    @property
+    def db_value(self) -> int:
+        """Convert enum to database integer value (lower = higher priority)"""
+        return {"normal": 5, "critical": 1}[self.value]
+    
+    @classmethod
+    def from_db_value(cls, db_value: int) -> 'JobPriority':
+        """Convert database integer back to enum"""
+        mapping = {5: cls.NORMAL, 1: cls.CRITICAL}
+        return mapping.get(db_value, cls.NORMAL)
+
 class Scheduler:
     HEARTBEAT_THRESHOLD = 120  # 2 minutes (in seconds)
+    MAX_RETRY_ATTEMPTS = 3     # For database operations
+    WORKER_ID_LENGTH = 8       # For worker identification
 
-    def __init__(self, db_pool: asyncpg.Pool):
+    def __init__(self, 
+                 db_pool: asyncpg.Pool, 
+                 max_concurrent_jobs: int = 10, 
+                 misfire_grace_time: int = 300):  # 5 minutes default
         """
-        Initialize the Scheduler.
+        Initialize the Scheduler with concurrency control and reliability features.
         
         Args:
             db_pool: Connection to the PostgreSQL database.
+            max_concurrent_jobs: Maximum number of jobs to run concurrently
+            misfire_grace_time: Seconds after execution_time before jobs expire (like APScheduler)
         """
         self.db_pool = db_pool
-        self.task_map = {}  # Store task functions dynamically
+        self.task_map = {}  # Store task functions
         self.is_running = False
+        self.is_shutting_down = False
+        
+        # Generate unique worker ID for this instance
+        self.worker_id = str(uuid.uuid4())[:self.WORKER_ID_LENGTH]
+        
+        # Concurrency control with tracking
+        self.job_semaphore = asyncio.Semaphore(max_concurrent_jobs)
+        self.max_concurrent_jobs = max_concurrent_jobs
+        self.active_jobs: Set[int] = set()  # Track active job IDs
+        
+        # Job expiration policy
+        self.misfire_grace_time = misfire_grace_time
+        
+        # Background tasks
         self.heartbeat_monitor_task = None
+        self.listener_task = None
+        self.orphan_recovery_task = None
+        
+        # Setup signal handlers for graceful shutdown
+        self._setup_signal_handlers()
+        
+        logger.info(f"Scheduler initialized: worker_id={self.worker_id}, "
+                   f"max_concurrent={max_concurrent_jobs}, misfire_grace={misfire_grace_time}s")
+
+    def _setup_signal_handlers(self):
+        """Setup signal handlers for graceful shutdown"""
+        if sys.platform != 'win32':
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                signal.signal(sig, self._signal_handler)
+
+    def _signal_handler(self, signum, frame):
+        """Handle shutdown signals gracefully"""
+        logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+        asyncio.create_task(self.stop())
 
     async def start(self):
-        """Start the scheduler"""
+        """Start the scheduler with reliability features"""
         if self.is_running:
             return
         
         self.is_running = True
+        self.is_shutting_down = False
         
         try:
-            # Initialize everything
+            # Initialize database with worker tracking
             await self.initialize_db()
             await self.load_task_functions()
             
-            # Start the heartbeat monitor
-            self.heartbeat_monitor_task = asyncio.create_task(self.monitor_heartbeats())
+            # RELIABILITY: Recover orphaned jobs from previous crashes
+            await self.recover_orphaned_jobs()
             
-            # Start the listener in the background
+            # Start background tasks
+            self.heartbeat_monitor_task = asyncio.create_task(self.monitor_heartbeats())
+            self.orphan_recovery_task = asyncio.create_task(self.periodic_orphan_recovery())
             self.listener_task = asyncio.create_task(self.listen_for_jobs())
+            
+            logger.info(f"Scheduler started: worker_id={self.worker_id}")
             
         except Exception as e:
             logger.error(f"Error starting scheduler: {e}")
             self.is_running = False
-            if self.heartbeat_monitor_task:
-                self.heartbeat_monitor_task.cancel()
+            await self._cleanup_background_tasks()
             raise
 
     async def stop(self):
-        """Stop the scheduler gracefully"""
-        if not self.is_running:
+        """Stop the scheduler gracefully with job completion"""
+        if not self.is_running or self.is_shutting_down:
             return
 
+        logger.info(f"Gracefully stopping scheduler {self.worker_id}...")
+        self.is_shutting_down = True
         self.is_running = False
         
-        # Cancel all running tasks
-        if self.heartbeat_monitor_task:
-            self.heartbeat_monitor_task.cancel()
-        if hasattr(self, 'listener_task'):
-            self.listener_task.cancel()
+        # Wait for active jobs to complete (with timeout)
+        if self.active_jobs:
+            logger.info(f"Waiting for {len(self.active_jobs)} active jobs to complete...")
+            timeout = 30  # 30 second timeout
+            start_time = asyncio.get_event_loop().time()
             
+            while self.active_jobs and (asyncio.get_event_loop().time() - start_time) < timeout:
+                await asyncio.sleep(1)
+            
+            if self.active_jobs:
+                logger.warning(f"Timed out waiting for jobs {self.active_jobs} to complete")
+        
+        # Clean up background tasks
+        await self._cleanup_background_tasks()
+        
+        # Mark any remaining jobs as failed (they'll be retried by other workers)
+        await self._mark_remaining_jobs_failed()
+        
+        logger.info(f"Scheduler {self.worker_id} stopped gracefully")
+
+    async def _cleanup_background_tasks(self):
+        """Clean up all background tasks"""
+        tasks = [self.heartbeat_monitor_task, self.listener_task, self.orphan_recovery_task]
+        for task in tasks:
+            if task and not task.done():
+                task.cancel()
+        
         # Wait for tasks to complete
-        await asyncio.gather(
-            self.heartbeat_monitor_task, 
-            self.listener_task, 
-            return_exceptions=True
-        )
+        await asyncio.gather(*[t for t in tasks if t], return_exceptions=True)
+
+    async def _mark_remaining_jobs_failed(self):
+        """Mark any jobs still tracked as active as failed for retry by other workers"""
+        if not self.active_jobs:
+            return
+            
+        try:
+            await self._execute_with_retry("""
+                UPDATE scheduled_jobs 
+                SET status = 'pending', 
+                    last_heartbeat = NULL,
+                    worker_id = NULL
+                WHERE job_id = ANY($1) AND status = 'running';
+            """, list(self.active_jobs))
+            
+            logger.info(f"Marked {len(self.active_jobs)} jobs for retry by other workers")
+            
+        except Exception as e:
+            logger.error(f"Failed to mark remaining jobs as failed: {e}")
 
     async def initialize_db(self):
-        """Set up the database: create tables and procedures if they don't exist."""
-        max_retries = 5
-        retry_delay = 1  # seconds
+        """Initialize database with worker tracking and reliability features"""
+        await self._execute_with_retry("""
+            CREATE TABLE IF NOT EXISTS scheduled_jobs (
+                job_id SERIAL PRIMARY KEY,
+                job_name TEXT NOT NULL,
+                execution_time TIMESTAMPTZ NOT NULL,
+                status TEXT DEFAULT 'pending',
+                task_data JSONB,
+                created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                last_heartbeat TIMESTAMPTZ,
+                priority INTEGER DEFAULT 5,
+                retry_count INTEGER DEFAULT 0,
+                max_retries INTEGER DEFAULT 3,
+                worker_id TEXT,  -- Track which worker is processing
+                error_message TEXT -- Track last error for debugging
+            );
+        """)
+        
+        # Create indexes for reliability and performance
+        await self._execute_with_retry("""
+            CREATE INDEX IF NOT EXISTS idx_jobs_pending_priority 
+            ON scheduled_jobs(status, priority ASC, execution_time ASC)
+            WHERE status = 'pending';
+        """)
+        
+        await self._execute_with_retry("""
+            CREATE INDEX IF NOT EXISTS idx_jobs_running_heartbeat 
+            ON scheduled_jobs(status, last_heartbeat, worker_id)
+            WHERE status = 'running';
+        """)
+        
+        await self._execute_with_retry("""
+            CREATE INDEX IF NOT EXISTS idx_jobs_worker_cleanup
+            ON scheduled_jobs(worker_id, status)
+            WHERE worker_id IS NOT NULL;
+        """)
+        
+        logger.info("Database initialized with reliability features")
+
+    async def _execute_with_retry(self, query: str, *args, max_retries: int = 3):
+        """Execute database query with retry logic for transient failures"""
+        last_exception = None
         
         for attempt in range(max_retries):
             try:
-                async with self.db_pool.acquire() as conn:
-                    # First create the table
-                    await conn.execute("""
-                        CREATE TABLE IF NOT EXISTS scheduled_jobs (
-                            job_id SERIAL PRIMARY KEY,
-                            job_name TEXT NOT NULL,
-                            execution_time TIMESTAMPTZ NOT NULL,
-                            status TEXT DEFAULT 'pending',
-                            task_data JSONB,
-                            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-                            last_heartbeat TIMESTAMPTZ
-                        );
-                    """)
-
-                    # Create or replace the notification function
-                    await conn.execute("""
-                        CREATE OR REPLACE FUNCTION notify_job_ready() RETURNS TRIGGER AS $$
-                        BEGIN
-                            -- Notify when a job is ready to run
-                            IF NEW.status = 'pending' AND NEW.execution_time <= CURRENT_TIMESTAMP THEN
-                                PERFORM pg_notify('ready_jobs', row_to_json(NEW)::text);
-                            END IF;
-                            RETURN NEW;
-                        END;
-                        $$ LANGUAGE plpgsql;
-                    """)
-
-                    # Create a single trigger
-                    await conn.execute("""
-                        DROP TRIGGER IF EXISTS job_ready_trigger ON scheduled_jobs;
-                        CREATE TRIGGER job_ready_trigger
-                        AFTER INSERT OR UPDATE ON scheduled_jobs
-                        FOR EACH ROW
-                        EXECUTE FUNCTION notify_job_ready();
-                    """)
-
-                    # Verify trigger installation
-                    triggers = await conn.fetch("""
-                        SELECT tgname, tgtype, tgenabled, tgisinternal
-                        FROM pg_trigger
-                        WHERE tgrelid = 'scheduled_jobs'::regclass;
-                    """)
-                    
-                    for trigger in triggers:
-                        logger.info(f"Installed trigger: {trigger}")
-
-                    logger.info("Database initialized successfully.")
-                    return  # Success, exit the retry loop
+                if args:
+                    return await self.db_pool.fetch(query, *args)
+                else:
+                    return await self.db_pool.fetch(query)
                     
             except Exception as e:
+                last_exception = e
                 if attempt < max_retries - 1:
-                    logger.warning(f"Database initialization attempt {attempt + 1} failed: {e}")
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
+                    # Exponential backoff for retries
+                    delay = (2 ** attempt) * 0.1  # 0.1s, 0.2s, 0.4s
+                    logger.warning(f"Database operation failed (attempt {attempt + 1}/{max_retries}), "
+                                 f"retrying in {delay}s: {e}")
+                    await asyncio.sleep(delay)
                 else:
-                    logger.error("Failed to initialize database after maximum retries")
-                    raise
+                    logger.error(f"Database operation failed permanently after {max_retries} attempts: {e}")
+        
+        raise last_exception
+
+    async def recover_orphaned_jobs(self):
+        """Recover jobs that were running when workers crashed"""
+        try:
+            # Find jobs that were "running" but have stale heartbeats or dead workers
+            current_time = datetime.datetime.now(UTC)
+            stale_threshold = current_time - datetime.timedelta(seconds=self.HEARTBEAT_THRESHOLD)
+            
+            recovered_jobs = await self._execute_with_retry("""
+                UPDATE scheduled_jobs 
+                SET status = 'pending', 
+                    worker_id = NULL,
+                    last_heartbeat = NULL
+                WHERE status = 'running' 
+                AND (last_heartbeat < $1 OR last_heartbeat IS NULL)
+                RETURNING job_id, job_name, worker_id;
+            """, stale_threshold)
+            
+            if recovered_jobs:
+                logger.warning(f"Recovered {len(recovered_jobs)} orphaned jobs from crashed workers")
+                for job in recovered_jobs:
+                    logger.debug(f"Recovered job {job['job_id']} ({job['job_name']}) "
+                               f"from worker {job['worker_id']}")
+            else:
+                logger.info("No orphaned jobs found during startup")
+                
+        except Exception as e:
+            logger.error(f"Failed to recover orphaned jobs: {e}")
+            # Don't raise - continue with scheduler startup
+
+    async def periodic_orphan_recovery(self):
+        """Periodically check for and recover orphaned jobs"""
+        while self.is_running:
+            try:
+                await asyncio.sleep(300)  # Check every 5 minutes
+                if not self.is_running:
+                    break
+                    
+                await self.recover_orphaned_jobs()
+                
+            except Exception as e:
+                logger.error(f"Error in periodic orphan recovery: {e}")
+                await asyncio.sleep(60)  # Back off on errors
 
     async def schedule(
         self, 
@@ -144,16 +289,20 @@ class Scheduler:
         *, 
         execution_time: datetime.datetime,
         args: tuple = (),
-        kwargs: dict = None
+        kwargs: dict = None,
+        priority: JobPriority = JobPriority.NORMAL,
+        max_retries: int = 3
     ):
         """
-        Schedule a function to run at a specific time.
+        Schedule an async I/O function to run at a specific time.
         
         Args:
-            func: The async function to schedule
+            func: The async function to schedule (must be async I/O only)
             execution_time: datetime object specifying when to run the job
             args: Tuple of positional arguments to pass to the function
             kwargs: Dictionary of keyword arguments to pass to the function
+            priority: Job priority using JobPriority enum (NORMAL or CRITICAL)
+            max_retries: Maximum retry attempts for failed jobs
         """
         if not inspect.iscoroutinefunction(func):
             raise TypeError(f"Expected an async function, got {type(func)}")
@@ -168,149 +317,310 @@ class Scheduler:
         }
         
         # Schedule the job in the database
-        await self.schedule_job(func.__name__, execution_time, task_data)
+        await self.schedule_job(
+            func.__name__, 
+            execution_time, 
+            task_data, 
+            priority=priority,
+            max_retries=max_retries
+        )
         
-        logger.info(f"Scheduled function {func.__name__} to run at {execution_time}")
+        logger.info(f"Scheduled async function {func.__name__} to run at {execution_time} (priority={priority.value})")
 
     async def listen_for_jobs(self):
-        """Listen for PostgreSQL notifications for ready jobs."""
-        async with self.db_pool.acquire() as conn:
-            # Listen only for ready jobs
-            await conn.add_listener('ready_jobs', self._handle_notification)
-            
-            while self.is_running:
-                try:
-                    # Check for ready jobs
-                    ready_jobs = await conn.fetch("""
-                        SELECT job_id, job_name, execution_time, status, task_data::text
-                        FROM scheduled_jobs
-                        WHERE status = 'pending'
-                        AND execution_time <= CURRENT_TIMESTAMP;
-                    """)
-                    
-                    # Execute any ready jobs
-                    for job_row in ready_jobs:
-                        task_data = json.loads(job_row['task_data'])
-                        job = Job(
-                            job_id=job_row['job_id'],
-                            job_name=job_row['job_name'],
-                            task_func=self.task_map.get(job_row['job_name']),
-                            task_data=task_data,
-                            status=JobStatus.PENDING
-                        )
-                        
-                        if job.task_func is None:
-                            logger.error(f"No task function found for job {job.job_name}")
-                            continue
-                            
-                        # Execute the job
-                        asyncio.create_task(self.execute_job_with_lock(job))
-                    
-                    await asyncio.sleep(1)
-                except Exception as e:
-                    logger.error(f"Error in job listener: {e}")
-                    await asyncio.sleep(1)
-
-    async def _handle_notification(self, connection, pid, channel, payload):
-        """Handle incoming job notifications"""
-        try:
-            logger.info(f"Received notification on channel {channel}: {payload}")  # Add debug logging
-            job_data = json.loads(payload)
-            job = Job(
-                job_id=job_data['job_id'],
-                job_name=job_data['job_name'],
-                task_func=self.task_map.get(job_data['job_name']),
-                task_data=job_data.get('task_data'),
-                status=JobStatus.PENDING
-            )
-            
-            if job.task_func is None:
-                logger.error(f"No task function found for job {job.job_name}")
-                return
+        """Listen for jobs with enhanced reliability"""
+        import random
+        
+        startup_jitter = random.uniform(0, 1.0)
+        await asyncio.sleep(startup_jitter)
+        
+        logger.info(f"Starting reliable job listener [worker={self.worker_id}]")
+        
+        while self.is_running and not self.is_shutting_down:
+            try:
+                if self.job_semaphore.locked():
+                    await asyncio.sleep(1.0)
+                    continue
                 
-            await self.execute_job_with_lock(job)
+                ready_jobs = await self.claim_jobs_atomically()
+                
+                if ready_jobs:
+                    logger.info(f"Claimed {len(ready_jobs)} jobs [worker={self.worker_id}]")
+                    
+                    for job_row in ready_jobs:
+                        if not self.is_running:
+                            break
+                        asyncio.create_task(self.execute_job_with_concurrency_control(job_row))
+                
+                # Adaptive sleep
+                if ready_jobs:
+                    jitter = random.uniform(-0.05, 0.05)
+                    await asyncio.sleep(0.1 + jitter)
+                else:
+                    jitter = random.uniform(-0.2, 0.2)
+                    await asyncio.sleep(2.0 + jitter)
+                    
+            except Exception as e:
+                logger.error(f"Error in job listener: {e}")
+                await asyncio.sleep(5)
+
+    async def claim_jobs_atomically(self):
+        """Claim jobs atomically with full reliability"""
+        available_slots = self.job_semaphore._value
+        if available_slots <= 0:
+            return []
+        
+        try:
+            # Use a transaction for atomic job claiming
+            async with self.db_pool.acquire() as conn:
+                async with conn.transaction():
+                    # Calculate expiration cutoff
+                    current_time = datetime.datetime.now(UTC)
+                    expiration_cutoff = current_time - datetime.timedelta(seconds=self.misfire_grace_time)
+                    
+                    # Expire old jobs
+                    expired_jobs = await conn.fetch("""
+                        UPDATE scheduled_jobs 
+                        SET status = 'expired', worker_id = $1
+                        WHERE status = 'pending' 
+                        AND execution_time < $2
+                        RETURNING job_id, job_name, execution_time;
+                    """, self.worker_id, expiration_cutoff)
+                    
+                    if expired_jobs:
+                        logger.warning(f"Expired {len(expired_jobs)} jobs past grace time")
+                    
+                    # Claim ready jobs atomically
+                    ready_jobs = await conn.fetch("""
+                        UPDATE scheduled_jobs 
+                        SET status = 'running', 
+                            last_heartbeat = NOW(),
+                            worker_id = $3
+                        WHERE job_id IN (
+                            SELECT job_id 
+                            FROM scheduled_jobs 
+                            WHERE status = 'pending' 
+                            AND execution_time <= CURRENT_TIMESTAMP
+                            AND execution_time >= $2
+                            ORDER BY priority ASC, execution_time ASC
+                            LIMIT $1
+                            FOR UPDATE SKIP LOCKED
+                        )
+                        RETURNING job_id, job_name, execution_time, task_data::text, 
+                                 priority, retry_count, max_retries;
+                    """, min(3, available_slots), expiration_cutoff, self.worker_id)
+                    
+                    # Track claimed jobs
+                    for job in ready_jobs:
+                        self.active_jobs.add(job['job_id'])
+                    
+                    return ready_jobs
+                    
         except Exception as e:
-            logger.error(f"Error handling job notification: {e}")
+            logger.error(f"Error claiming jobs atomically: {e}")
+            return []
+
+    async def execute_job_with_concurrency_control(self, job_row):
+        """Execute job with full reliability and proper resource management"""
+        job_id = job_row['job_id']
+        
+        # Ensure semaphore is always released
+        try:
+            async with self.job_semaphore:
+                await self.execute_job_with_reliability(job_row)
+        except Exception as e:
+            logger.error(f"Critical error in job {job_id} execution: {e}")
+            # Ensure job is properly marked as failed
+            await self._safe_mark_job_failed(job_id, str(e))
+        finally:
+            # Always remove from active jobs tracking
+            self.active_jobs.discard(job_id)
+
+    async def execute_job_with_reliability(self, job_row):
+        """Execute job with comprehensive error handling and state management"""
+        job_id = job_row['job_id']
+        job_name = job_row['job_name']
+        priority = JobPriority.from_db_value(job_row.get('priority', 5))
+        
+        # Start heartbeat task
+        heartbeat_task = asyncio.create_task(self.send_heartbeat(job_id))
+        
+        try:
+            # Validate job data
+            task_data = json.loads(job_row['task_data'])
+            task_func = self.task_map.get(job_name)
+            
+            if task_func is None:
+                error_msg = f"No task function found for job {job_name}"
+                await self._safe_mark_job_failed(job_id, error_msg)
+                return
+            
+            logger.info(f"Executing job {job_id} ({job_name}) [priority={priority.value}] [worker={self.worker_id}]")
+            
+            # Execute the function with timeout protection
+            args = task_data.get('args', ())
+            kwargs = task_data.get('kwargs', {})
+            
+            # Add timeout to prevent runaway jobs
+            try:
+                result = await asyncio.wait_for(
+                    task_func(*args, **kwargs),
+                    timeout=3600  # 1 hour max per job
+                )
+            except asyncio.TimeoutError:
+                raise Exception("Job execution timed out after 1 hour")
+            
+            # Atomically mark as completed
+            success = await self._safe_mark_job_completed(job_id)
+            if success:
+                logger.info(f"Job {job_id} completed successfully [worker={self.worker_id}]")
+            else:
+                logger.warning(f"Job {job_id} completed but failed to update status - may be retried")
+            
+        except Exception as e:
+            # Handle job failure with retry logic
+            await self._handle_job_failure(job_row, str(e))
+            
+        finally:
+            # Always stop heartbeat task
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _handle_job_failure(self, job_row, error_message):
+        """Handle job failure with proper retry logic"""
+        job_id = job_row['job_id']
+        retry_count = job_row.get('retry_count', 0)
+        max_retries = job_row.get('max_retries', 3)
+        
+        if retry_count < max_retries:
+            # Schedule retry with exponential backoff
+            retry_delay = min(2 ** retry_count * 60, 300)  # Max 5 minutes
+            retry_time = datetime.datetime.now(UTC) + datetime.timedelta(seconds=retry_delay)
+            
+            success = await self._safe_schedule_retry(job_id, retry_count + 1, retry_time, error_message)
+            
+            if success:
+                logger.warning(f"Job {job_id} failed (attempt {retry_count + 1}/{max_retries}), "
+                             f"retrying at {retry_time}: {error_message}")
+            else:
+                logger.error(f"Job {job_id} failed and couldn't schedule retry: {error_message}")
+        else:
+            # Exhausted retries - mark as permanently failed
+            await self._safe_mark_job_failed(job_id, error_message)
+            logger.error(f"Job {job_id} permanently failed after {max_retries} attempts: {error_message}")
+
+    async def _safe_mark_job_completed(self, job_id: int) -> bool:
+        """Safely mark job as completed with verification"""
+        try:
+            result = await self._execute_with_retry("""
+                UPDATE scheduled_jobs 
+                SET status = 'completed', 
+                    last_heartbeat = NOW(),
+                    error_message = NULL
+                WHERE job_id = $1 AND status = 'running' AND worker_id = $2
+                RETURNING job_id;
+            """, job_id, self.worker_id)
+            
+            return len(result) > 0  # True if update succeeded
+            
+        except Exception as e:
+            logger.error(f"Failed to mark job {job_id} as completed: {e}")
+            return False
+
+    async def _safe_mark_job_failed(self, job_id: int, error_message: str):
+        """Safely mark job as failed"""
+        try:
+            await self._execute_with_retry("""
+                UPDATE scheduled_jobs 
+                SET status = 'failed',
+                    error_message = $2,
+                    last_heartbeat = NOW()
+                WHERE job_id = $1 AND worker_id = $3;
+            """, job_id, error_message[:1000], self.worker_id)  # Limit error message length
+            
+        except Exception as e:
+            logger.error(f"Failed to mark job {job_id} as failed: {e}")
+
+    async def _safe_schedule_retry(self, job_id: int, retry_count: int, retry_time: datetime.datetime, error_message: str) -> bool:
+        """Safely schedule job retry"""
+        try:
+            result = await self._execute_with_retry("""
+                UPDATE scheduled_jobs 
+                SET status = 'pending',
+                    retry_count = $2,
+                    execution_time = $3,
+                    error_message = $4,
+                    worker_id = NULL,
+                    last_heartbeat = NULL
+                WHERE job_id = $1 AND worker_id = $5
+                RETURNING job_id;
+            """, job_id, retry_count, retry_time, error_message[:1000], self.worker_id)
+            
+            return len(result) > 0
+            
+        except Exception as e:
+            logger.error(f"Failed to schedule retry for job {job_id}: {e}")
+            return False
 
     async def load_task_functions(self):
-        """Load task functions from the task map."""
-        # Query the database for existing jobs and their job names
-        jobs = await self.db_pool.fetch("""
-            SELECT DISTINCT job_name FROM scheduled_jobs;
-        """)
-
-        # Log any jobs that don't have a matching function
-        for job in jobs:
-            job_name = job['job_name']
-            if job_name not in self.task_map:
-                logger.warning(f"No matching task function found for job: {job_name}")
+        """Load task functions with error handling"""
+        try:
+            jobs = await self._execute_with_retry("""
+                SELECT DISTINCT job_name FROM scheduled_jobs WHERE status IN ('pending', 'running');
+            """)
+            
+            for job in jobs:
+                job_name = job['job_name']
+                if job_name not in self.task_map:
+                    logger.warning(f"No task function found for job: {job_name}")
+        except Exception as e:
+            logger.error(f"Error loading task functions: {e}")
 
     async def monitor_heartbeats(self):
-        """Periodically check for jobs that have a stale heartbeat and mark them as FAILED or RETRYING."""
-        while True:
-            # Calculate the threshold for the last valid heartbeat
-            current_time = datetime.datetime.now(UTC)
-            heartbeat_threshold_time = current_time - datetime.timedelta(seconds=self.HEARTBEAT_THRESHOLD)
+        """Monitor heartbeats with enhanced reliability"""
+        while self.is_running:
             try:
-                # Fetch jobs with stale heartbeats (running jobs whose last_heartbeat is too old)
-                stale_jobs = await self.db_pool.fetch("""
-                    SELECT job_id, job_name, last_heartbeat
-                    FROM scheduled_jobs
-                    WHERE status = 'running' AND last_heartbeat < $1;
-                """, heartbeat_threshold_time)
-
-                for job in stale_jobs:
-                    # Mark these jobs as FAILED since their heartbeat is stale
-                    await self.update_job_status(job['job_id'], JobStatus.FAILED)
-                    logger.error(f"Job {job['job_id']} has been marked as FAILED due to stale heartbeat.")
+                current_time = datetime.datetime.now(UTC)
+                threshold = current_time - datetime.timedelta(seconds=self.HEARTBEAT_THRESHOLD)
+                
+                failed_jobs = await self._execute_with_retry("""
+                    UPDATE scheduled_jobs 
+                    SET status = 'pending',
+                        worker_id = NULL,
+                        last_heartbeat = NULL
+                    WHERE status = 'running' 
+                    AND last_heartbeat < $1
+                    RETURNING job_id, job_name, worker_id, last_heartbeat;
+                """, threshold)
+                
+                for job in failed_jobs:
+                    logger.error(f"Detected stale job {job['job_id']} from worker {job['worker_id']}, "
+                               f"marking for retry (last heartbeat: {job['last_heartbeat']})")
+                
             except Exception as e:
-                logger.error(f"An error occurred while monitoring heartbeats: {e}")
+                logger.error(f"Error monitoring heartbeats: {e}")
+                
             await asyncio.sleep(60)
 
-
     async def send_heartbeat(self, job_id):
-        """Send periodic heartbeats while a job is running."""
+        """Send heartbeats with error handling"""
         while True:
-            await self.db_pool.execute("""
-                UPDATE scheduled_jobs SET last_heartbeat = NOW()
-                WHERE job_id = $1 AND status = 'running';
-            """, job_id)
-            await asyncio.sleep(30)  # Send heartbeat every 30 seconds
+            try:
+                await self._execute_with_retry("""
+                    UPDATE scheduled_jobs SET last_heartbeat = NOW()
+                    WHERE job_id = $1 AND status = 'running' AND worker_id = $2;
+                """, job_id, self.worker_id)
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Heartbeat failed for job {job_id}: {e}")
+                await asyncio.sleep(30)
 
-    async def pick_job(self, job_id):
-        """
-        Atomically pick a job and transition it from PENDING to RUNNING.
-        """
-        async with self.db_pool.acquire() as conn:
-            job_row = await conn.fetchrow("""
-                UPDATE scheduled_jobs
-                SET status = 'running'
-                WHERE job_id = $1 AND status = 'pending'
-                RETURNING job_id, job_name, task_data::text;
-            """, job_id)
-
-            if job_row:
-                logger.info(f"Picked job {job_row['job_id']} for execution.")
-                # Parse the JSON task_data
-                task_data = json.loads(job_row['task_data'])
-                task_func = self.task_map.get(job_row['job_name'])
-                
-                if task_func is None:
-                    logger.error(f"No task function found for job {job_row['job_name']}")
-                    return None
-                    
-                return Job(
-                    job_id=job_row['job_id'],
-                    job_name=job_row['job_name'],
-                    task_func=task_func,
-                    task_data=task_data,
-                    status=JobStatus.RUNNING
-                )
-            else:
-                logger.info(f"Job {job_id} is no longer available for execution.")
-                return None
-            
-    async def schedule_job(self, job_name, execution_time, task_data):
+    async def schedule_job(self, job_name, execution_time, task_data, priority: JobPriority = JobPriority.NORMAL, max_retries: int = 3):
         """
         Schedule a job by inserting it into the 'scheduled_jobs' table.
         
@@ -318,107 +628,17 @@ class Scheduler:
             job_name (str): The name of the job to schedule.
             execution_time (datetime): The time at which the job should be executed.
             task_data (dict): Additional data required for the job execution.
+            priority: Job priority using JobPriority enum (NORMAL or CRITICAL)
+            max_retries: Maximum retry attempts for failed jobs
         """
         json_task_data = json.dumps(task_data)
         
-        async with self.db_pool.acquire() as conn:
-            # Insert the job
-            await conn.execute("""
-                INSERT INTO scheduled_jobs (job_name, execution_time, status, task_data)
-                VALUES ($1, $2, 'pending', $3::jsonb);
-            """, job_name, execution_time, json_task_data)
-            
-            # Debug: Check the job status
-            job = await conn.fetchrow("""
-                SELECT job_id, job_name, execution_time, status
-                FROM scheduled_jobs
-                WHERE job_name = $1
-                ORDER BY job_id DESC
-                LIMIT 1;
-            """, job_name)
-            
-            logger.info(f"Job scheduled: {job}")
-
-    async def execute_job_with_lock(self, job: Job):
-        """
-        Acquire a lock, schedule and execute a job, ensuring atomic status transitions.
-        """
-        async with self.db_pool.acquire() as conn:
-            # Acquire an advisory lock for the job
-            lock_acquired = await conn.fetchval("SELECT pg_try_advisory_lock($1);", job.job_id)
-            
-            if not lock_acquired:
-                logger.warning(f"Could not acquire lock for job {job.job_id}. Another worker may be processing it.")
-                return
-
-            logger.info(f"Acquired lock for job {job.job_id}.")
-
-            # Start the heartbeat loop in the background
-            heartbeat_task = asyncio.create_task(self.send_heartbeat(job.job_id))
-
-            try:
-                # Transition the job status from PENDING to RUNNING using the same connection
-                job_row = await conn.fetchrow("""
-                    UPDATE scheduled_jobs
-                    SET status = 'running'
-                    WHERE job_id = $1 AND status = 'pending'
-                    RETURNING job_id, job_name, task_data::text;
-                """, job.job_id)
-
-                if job_row:
-                    logger.info(f"Picked job {job_row['job_id']} for execution.")
-                    task_data = json.loads(job_row['task_data'])
-                    task_func = self.task_map.get(job_row['job_name'])
-                    
-                    if task_func is None:
-                        logger.error(f"No task function found for job {job_row['job_name']}")
-                        return None
-
-                    picked_job = Job(
-                        job_id=job_row['job_id'],
-                        job_name=job_row['job_name'],
-                        task_func=task_func,
-                        task_data=task_data,
-                        status=JobStatus.RUNNING
-                    )
-
-                    # Unpack arguments from task_data
-                    args = picked_job.task_data.get('args', ())
-                    kwargs = picked_job.task_data.get('kwargs', {})
-                    
-                    # Execute the function with unpacked arguments
-                    result = await picked_job.task_func(*args, **kwargs)
-
-                    # Mark the job as completed
-                    await conn.execute("""
-                        UPDATE scheduled_jobs
-                        SET status = $1
-                        WHERE job_id = $2;
-                    """, JobStatus.COMPLETED.value, picked_job.job_id)
-                    
-                    logger.info(f"Job {picked_job.job_id} completed successfully with result: {result}")
-
-            except Exception as e:
-                # If something goes wrong, mark the job as failed
-                await conn.execute("""
-                    UPDATE scheduled_jobs
-                    SET status = $1
-                    WHERE job_id = $2;
-                """, JobStatus.FAILED.value, job.job_id)
-                logger.error(f"Job {job.job_id} failed with error: {e}")
-
-            finally:
-                # Ensure that the heartbeat task is cancelled
-                heartbeat_task.cancel()
-                try:
-                    await heartbeat_task
-                except asyncio.CancelledError:
-                    logger.info(f"Heartbeat task for job {job.job_id} cancelled.")
-                
-                # Release the advisory lock using the same connection
-                await conn.execute("SELECT pg_advisory_unlock($1);", job.job_id)
-                logger.info(f"Released lock for job {job.job_id}.")
-
+        await self._execute_with_retry("""
+            INSERT INTO scheduled_jobs (job_name, execution_time, status, task_data, priority, max_retries)
+            VALUES ($1, $2, 'pending', $3::jsonb, $4, $5);
+        """, job_name, execution_time, json_task_data, priority.db_value, max_retries)
+        
+        logger.info(f"Job scheduled: {job_name} at {execution_time} (priority={priority.value})")
 
     async def update_job_status(self, job_id, status):
         """
