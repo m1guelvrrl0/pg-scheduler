@@ -11,6 +11,7 @@ from datetime import UTC
 from typing import Optional, Set
 from enum import Enum
 import uuid
+import random
 
 logging.basicConfig(
     level=logging.INFO,
@@ -336,7 +337,6 @@ class Scheduler:
 
     async def listen_for_jobs(self):
         """Listen for jobs with enhanced reliability"""
-        import random
         
         startup_jitter = random.uniform(0, 1.0)
         await asyncio.sleep(startup_jitter)
