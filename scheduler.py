@@ -35,8 +35,15 @@ class JobPriority(Enum):
         mapping = {5: cls.NORMAL, 1: cls.CRITICAL}
         return mapping.get(db_value, cls.NORMAL)
 
+class ConflictResolution(Enum):
+    """Strategies for handling duplicate job_id conflicts"""
+    RAISE = "raise"        # Raise ValueError (default, safest)
+    IGNORE = "ignore"      # Ignore the new job, return existing job_id  
+    REPLACE = "replace"    # Replace/update the existing job with new parameters
+
 class Scheduler:
     HEARTBEAT_THRESHOLD = 120  # 2 minutes (in seconds)
+    LEASE_DURATION = 60        # 1 minute lease duration (in seconds)
     MAX_RETRY_ATTEMPTS = 3     # For database operations
     WORKER_ID_LENGTH = 8       # For worker identification
 
@@ -168,6 +175,7 @@ class Scheduler:
                 UPDATE scheduled_jobs 
                 SET status = 'pending', 
                     last_heartbeat = NULL,
+                    lease_until = NULL,
                     worker_id = NULL
                 WHERE job_id = ANY($1) AND status = 'running';
             """, list(self.active_jobs))
@@ -188,6 +196,7 @@ class Scheduler:
                 task_data JSONB,
                 created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                 last_heartbeat TIMESTAMPTZ,
+                lease_until TIMESTAMPTZ,  -- Explicit lease expiration
                 priority INTEGER DEFAULT 5,
                 retry_count INTEGER DEFAULT 0,
                 max_retries INTEGER DEFAULT 0,
@@ -200,6 +209,12 @@ class Scheduler:
         await self._execute_with_retry("""
             CREATE INDEX IF NOT EXISTS idx_jobs_pending_priority 
             ON scheduled_jobs(status, priority ASC, execution_time ASC)
+            WHERE status = 'pending';
+        """)
+        
+        await self._execute_with_retry("""
+            CREATE INDEX IF NOT EXISTS idx_jobs_lease_expiration
+            ON scheduled_jobs(status, lease_until, execution_time)
             WHERE status = 'pending';
         """)
         
@@ -252,7 +267,8 @@ class Scheduler:
                 UPDATE scheduled_jobs 
                 SET status = 'pending', 
                     worker_id = NULL,
-                    last_heartbeat = NULL
+                    last_heartbeat = NULL,
+                    lease_until = NULL
                 WHERE status = 'running' 
                 AND (last_heartbeat < $1 OR last_heartbeat IS NULL)
                 RETURNING job_id, job_name, worker_id;
@@ -293,7 +309,8 @@ class Scheduler:
         kwargs: dict = None,
         priority: JobPriority = JobPriority.NORMAL,
         max_retries: int = 0,
-        job_id: Optional[str] = None
+        job_id: Optional[str] = None,
+        conflict_resolution: ConflictResolution = ConflictResolution.RAISE
     ) -> str:
         """
         Schedule an async I/O function to run at a specific time.
@@ -306,6 +323,7 @@ class Scheduler:
             priority: Job priority using JobPriority enum (NORMAL or CRITICAL)
             max_retries: Maximum retry attempts for failed jobs
             job_id: Optional custom job ID (auto-generated if not provided)
+            conflict_resolution: How to handle duplicate job_id (RAISE, IGNORE, REPLACE)
             
         Returns:
             str: The job ID of the scheduled job
@@ -329,7 +347,8 @@ class Scheduler:
             task_data, 
             priority=priority,
             max_retries=max_retries,
-            job_id=job_id
+            job_id=job_id,
+            conflict_resolution=conflict_resolution
         )
         
         logger.info(f"Scheduled async function {func.__name__} to run at {execution_time} (priority={priority.value}, job_id={scheduled_job_id})")
@@ -372,7 +391,7 @@ class Scheduler:
                 await asyncio.sleep(5)
 
     async def claim_jobs_atomically(self):
-        """Claim jobs atomically with full reliability"""
+        """Claim jobs atomically with lease-based reliability"""
         available_slots = self.job_semaphore._value
         if available_slots <= 0:
             return []
@@ -381,11 +400,11 @@ class Scheduler:
             # Use a transaction for atomic job claiming
             async with self.db_pool.acquire() as conn:
                 async with conn.transaction():
-                    # Calculate expiration cutoff
+                    # Calculate expiration cutoff for misfire grace time
                     current_time = datetime.datetime.now(UTC)
                     expiration_cutoff = current_time - datetime.timedelta(seconds=self.misfire_grace_time)
                     
-                    # Expire old jobs
+                    # Expire old jobs that are past the misfire grace time
                     expired_jobs = await conn.fetch("""
                         UPDATE scheduled_jobs 
                         SET status = 'expired', worker_id = $1
@@ -397,25 +416,28 @@ class Scheduler:
                     if expired_jobs:
                         logger.warning(f"Expired {len(expired_jobs)} jobs past grace time")
                     
-                    # Claim ready jobs atomically
+                    # Claim ready jobs atomically using CTE pattern
                     ready_jobs = await conn.fetch("""
-                        UPDATE scheduled_jobs 
-                        SET status = 'running', 
-                            last_heartbeat = NOW(),
-                            worker_id = $3
-                        WHERE job_id IN (
-                            SELECT job_id 
-                            FROM scheduled_jobs 
-                            WHERE status = 'pending' 
-                            AND execution_time <= CURRENT_TIMESTAMP
-                            AND execution_time >= $2
-                            ORDER BY priority ASC, execution_time ASC
-                            LIMIT $1
+                        WITH to_claim AS (
+                            SELECT job_id
+                            FROM scheduled_jobs
+                            WHERE status = 'pending'
+                            AND execution_time <= NOW()  -- ready to execute
+                            AND (lease_until IS NULL OR lease_until < NOW())  -- not currently leased
+                            ORDER BY priority ASC, execution_time ASC, job_id ASC
                             FOR UPDATE SKIP LOCKED
+                            LIMIT $1
                         )
-                        RETURNING job_id, job_name, execution_time, task_data::text, 
-                                 priority, retry_count, max_retries;
-                    """, min(3, available_slots), expiration_cutoff, self.worker_id)
+                        UPDATE scheduled_jobs j
+                        SET status = 'running',
+                            last_heartbeat = NOW(),
+                            lease_until = NOW() + INTERVAL '60 seconds',
+                            worker_id = $2
+                        FROM to_claim c
+                        WHERE j.job_id = c.job_id
+                        RETURNING j.job_id, j.job_name, j.execution_time, j.task_data::text,
+                                  j.priority, j.retry_count, j.max_retries;
+                    """, min(3, available_slots), self.worker_id)
                     
                     # Track claimed jobs
                     for job in ready_jobs:
@@ -561,7 +583,8 @@ class Scheduler:
                     execution_time = $3,
                     error_message = $4,
                     worker_id = NULL,
-                    last_heartbeat = NULL
+                    last_heartbeat = NULL,
+                    lease_until = NULL
                 WHERE job_id = $1 AND worker_id = $5
                 RETURNING job_id;
             """, job_id, retry_count, retry_time, error_message[:1000], self.worker_id)
@@ -587,25 +610,29 @@ class Scheduler:
             logger.error(f"Error loading task functions: {e}")
 
     async def monitor_heartbeats(self):
-        """Monitor heartbeats with enhanced reliability"""
+        """Monitor heartbeats and lease expiration with enhanced reliability"""
         while self.is_running:
             try:
                 current_time = datetime.datetime.now(UTC)
-                threshold = current_time - datetime.timedelta(seconds=self.HEARTBEAT_THRESHOLD)
+                heartbeat_threshold = current_time - datetime.timedelta(seconds=self.HEARTBEAT_THRESHOLD)
                 
+                # Check for both stale heartbeats AND expired leases
                 failed_jobs = await self._execute_with_retry("""
                     UPDATE scheduled_jobs 
                     SET status = 'pending',
                         worker_id = NULL,
-                        last_heartbeat = NULL
+                        last_heartbeat = NULL,
+                        lease_until = NULL
                     WHERE status = 'running' 
-                    AND last_heartbeat < $1
-                    RETURNING job_id, job_name, worker_id, last_heartbeat;
-                """, threshold)
+                    AND (last_heartbeat < $1 OR lease_until < NOW())
+                    RETURNING job_id, job_name, worker_id, last_heartbeat, lease_until;
+                """, heartbeat_threshold)
                 
                 for job in failed_jobs:
+                    lease_expired = job['lease_until'] and job['lease_until'] < current_time
+                    reason = "lease expired" if lease_expired else "stale heartbeat"
                     logger.error(f"Detected stale job {job['job_id']} from worker {job['worker_id']}, "
-                               f"marking for retry (last heartbeat: {job['last_heartbeat']})")
+                               f"marking for retry ({reason}: heartbeat={job['last_heartbeat']}, lease_until={job['lease_until']})")
                 
             except Exception as e:
                 logger.error(f"Error monitoring heartbeats: {e}")
@@ -613,11 +640,13 @@ class Scheduler:
             await asyncio.sleep(60)
 
     async def send_heartbeat(self, job_id):
-        """Send heartbeats with error handling"""
+        """Send heartbeats with lease renewal"""
         while True:
             try:
                 await self._execute_with_retry("""
-                    UPDATE scheduled_jobs SET last_heartbeat = NOW()
+                    UPDATE scheduled_jobs 
+                    SET last_heartbeat = NOW(),
+                        lease_until = NOW() + INTERVAL '60 seconds'
                     WHERE job_id = $1 AND status = 'running' AND worker_id = $2;
                 """, job_id, self.worker_id)
                 await asyncio.sleep(30)
@@ -627,7 +656,7 @@ class Scheduler:
                 logger.error(f"Heartbeat failed for job {job_id}: {e}")
                 await asyncio.sleep(30)
 
-    async def schedule_job(self, job_name, execution_time, task_data, priority: JobPriority = JobPriority.NORMAL, max_retries: int = 0, job_id: Optional[str] = None) -> str:
+    async def schedule_job(self, job_name, execution_time, task_data, priority: JobPriority = JobPriority.NORMAL, max_retries: int = 0, job_id: Optional[str] = None, conflict_resolution: ConflictResolution = ConflictResolution.RAISE) -> str:
         """
         Schedule a job by inserting it into the 'scheduled_jobs' table.
         
@@ -638,19 +667,84 @@ class Scheduler:
             priority: Job priority using JobPriority enum (NORMAL or CRITICAL)
             max_retries: Maximum retry attempts for failed jobs
             job_id: Optional custom job ID (auto-generated if not provided)
+            conflict_resolution: How to handle duplicate job_id (RAISE, IGNORE, REPLACE)
             
         Returns:
             str: The job ID of the scheduled job
+            
+        Raises:
+            ValueError: If the provided job_id already exists and conflict_resolution is RAISE
         """
         json_task_data = json.dumps(task_data)
         
         if job_id is not None:
-            # Insert with custom job_id
-            result = await self._execute_with_retry("""
-                INSERT INTO scheduled_jobs (job_id, job_name, execution_time, status, task_data, priority, max_retries)
-                VALUES ($1, $2, $3, 'pending', $4::jsonb, $5, $6)
-                RETURNING job_id;
-            """, job_id, job_name, execution_time, json_task_data, priority.db_value, max_retries)
+            # Check if job_id already exists first
+            try:
+                existing_job = await self._execute_with_retry("""
+                    SELECT job_id, status FROM scheduled_jobs WHERE job_id = $1;
+                """, job_id)
+                
+                if existing_job:
+                    existing_status = existing_job[0]['status']
+                    
+                    if conflict_resolution == ConflictResolution.RAISE:
+                        raise ValueError(
+                            f"Job ID '{job_id}' already exists with status '{existing_status}'. "
+                            f"Choose a different job_id or omit it for auto-generation."
+                        )
+                    elif conflict_resolution == ConflictResolution.IGNORE:
+                        logger.info(f"Job ID '{job_id}' already exists, ignoring new job (conflict_resolution=IGNORE)")
+                        return job_id
+                    elif conflict_resolution == ConflictResolution.REPLACE:
+                        # Replace/update the existing job
+                        result = await self._execute_with_retry("""
+                            UPDATE scheduled_jobs 
+                            SET job_name = $2,
+                                execution_time = $3,
+                                task_data = $4::jsonb,
+                                priority = $5,
+                                max_retries = $6,
+                                status = CASE 
+                                    WHEN status IN ('completed', 'failed', 'cancelled', 'expired') THEN 'pending'
+                                    ELSE status
+                                END,
+                                retry_count = 0,
+                                error_message = NULL,
+                                worker_id = NULL,
+                                last_heartbeat = NULL,
+                                lease_until = NULL
+                            WHERE job_id = $1
+                            RETURNING job_id;
+                        """, job_id, job_name, execution_time, json_task_data, priority.db_value, max_retries)
+                        
+                        logger.info(f"Job ID '{job_id}' replaced with new parameters (conflict_resolution=REPLACE)")
+                        return result[0]['job_id']
+                
+                # Insert with custom job_id (now we know it's unique)
+                result = await self._execute_with_retry("""
+                    INSERT INTO scheduled_jobs (job_id, job_name, execution_time, status, task_data, priority, max_retries)
+                    VALUES ($1, $2, $3, 'pending', $4::jsonb, $5, $6)
+                    RETURNING job_id;
+                """, job_id, job_name, execution_time, json_task_data, priority.db_value, max_retries)
+                
+            except ValueError:
+                # Re-raise our custom error
+                raise
+            except Exception as e:
+                # Handle race condition: someone else inserted the same job_id between our check and insert
+                if "duplicate key value violates unique constraint" in str(e):
+                    if conflict_resolution == ConflictResolution.RAISE:
+                        raise ValueError(
+                            f"Job ID '{job_id}' was just created by another process. "
+                            f"Choose a different job_id or omit it for auto-generation."
+                        )
+                    else:
+                        # For IGNORE or REPLACE, try again (recursively call with same parameters)
+                        logger.warning(f"Race condition detected for job_id '{job_id}', retrying with conflict_resolution={conflict_resolution.value}")
+                        return await self.schedule_job(job_name, execution_time, task_data, priority, max_retries, job_id, conflict_resolution)
+                else:
+                    # Re-raise unexpected errors
+                    raise
         else:
             # Let database auto-generate job_id
             result = await self._execute_with_retry("""
@@ -678,7 +772,8 @@ class Scheduler:
                 UPDATE scheduled_jobs 
                 SET status = 'cancelled', 
                     worker_id = NULL,
-                    last_heartbeat = NULL
+                    last_heartbeat = NULL,
+                    lease_until = NULL
                 WHERE job_id = $1 
                 AND status IN ('pending', 'running')
                 RETURNING job_id, job_name, status;
