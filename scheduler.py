@@ -69,7 +69,6 @@ class Scheduler:
         
         # Concurrency control with tracking
         self.job_semaphore = asyncio.Semaphore(max_concurrent_jobs)
-        self.max_concurrent_jobs = max_concurrent_jobs
         self.active_jobs: Set[str] = set()  # Track active job IDs
         
         # Job expiration policy
@@ -355,7 +354,7 @@ class Scheduler:
         return scheduled_job_id
 
     async def listen_for_jobs(self):
-        """Listen for jobs with enhanced reliability"""
+        """Listen for jobs with enhanced reliability and conservative semaphore management"""
         
         startup_jitter = random.uniform(0, 1.0)
         await asyncio.sleep(startup_jitter)
@@ -364,18 +363,24 @@ class Scheduler:
         
         while self.is_running and not self.is_shutting_down:
             try:
-                if self.job_semaphore.locked():
+                # only claim jobs when semaphore definitely has slots
+                available_slots = self.job_semaphore._value
+                if available_slots <= 0:
                     await asyncio.sleep(1.0)
                     continue
                 
-                ready_jobs = await self.claim_jobs_atomically()
+                # Claim only 1 job at a time to prevent semaphore race conditions
+                # TODO: Maybe add tie breaker
+                # TODO: Maybe revert to bulk claim here once we find a safe way to do it
+                ready_jobs = await self.claim_jobs_with_slots(1)
                 
                 if ready_jobs:
-                    logger.info(f"Claimed {len(ready_jobs)} jobs [worker={self.worker_id}]")
-                    
+                    logger.info(f"Claimed {len(ready_jobs)} jobs [worker={self.worker_id}] (conservative claiming)")
+
                     for job_row in ready_jobs:
                         if not self.is_running:
                             break
+                        # Use the original execute method with proper semaphore handling
                         asyncio.create_task(self.execute_job_with_concurrency_control(job_row))
                 
                 # Adaptive sleep
@@ -449,6 +454,63 @@ class Scheduler:
             logger.error(f"Error claiming jobs atomically: {e}")
             return []
 
+    async def claim_jobs_with_slots(self, num_slots: int):
+        """Claim jobs from database when we already have semaphore slots reserved"""
+        try:
+            # Use a transaction for atomic job claiming
+            async with self.db_pool.acquire() as conn:
+                async with conn.transaction():
+                    # Calculate expiration cutoff for misfire grace time
+                    current_time = datetime.datetime.now(UTC)
+                    expiration_cutoff = current_time - datetime.timedelta(seconds=self.misfire_grace_time)
+                    
+                    # Expire old jobs that are past the misfire grace time
+                    expired_jobs = await conn.fetch("""
+                        UPDATE scheduled_jobs 
+                        SET status = 'expired', worker_id = $1
+                        WHERE status = 'pending' 
+                        AND execution_time < $2
+                        RETURNING job_id, job_name, execution_time;
+                    """, self.worker_id, expiration_cutoff)
+                    
+                    if expired_jobs:
+                        logger.warning(f"Expired {len(expired_jobs)} jobs past grace time")
+                    
+                    # Claim ready jobs atomically using CTE pattern (limited by available semaphore slots)
+                    ready_jobs = await conn.fetch("""
+                        WITH to_claim AS (
+                            SELECT job_id
+                            FROM scheduled_jobs
+                            WHERE status = 'pending'
+                            AND execution_time <= NOW()  -- ready to execute
+                            AND (lease_until IS NULL OR lease_until < NOW())  -- not currently leased
+                            ORDER BY priority ASC, execution_time ASC, job_id ASC
+                            FOR UPDATE SKIP LOCKED
+                            LIMIT $1
+                        )
+                        UPDATE scheduled_jobs j
+                        SET status = 'running',
+                            last_heartbeat = NOW(),
+                            lease_until = NOW() + INTERVAL '60 seconds',
+                            worker_id = $2
+                        FROM to_claim c
+                        WHERE j.job_id = c.job_id
+                        RETURNING j.job_id, j.job_name, j.execution_time, j.task_data::text,
+                                  j.priority, j.retry_count, j.max_retries;
+                    """, num_slots, self.worker_id)
+                    
+                    # Track claimed jobs
+                    for job in ready_jobs:
+                        self.active_jobs.add(job['job_id'])
+                    
+                    return ready_jobs
+                    
+        except Exception as e:
+            logger.error(f"Error claiming jobs with slots: {e}")
+            return []
+
+
+
     async def execute_job_with_concurrency_control(self, job_row):
         """Execute job with full reliability and proper resource management"""
         job_id = job_row['job_id']
@@ -479,6 +541,7 @@ class Scheduler:
             task_data = json.loads(job_row['task_data'])
             task_func = self.task_map.get(job_name)
             
+            # Handle missing function gracefully
             if task_func is None:
                 error_msg = f"No task function found for job {job_name}"
                 await self._safe_mark_job_failed(job_id, error_msg)
