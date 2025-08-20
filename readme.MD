@@ -164,11 +164,11 @@ CREATE TABLE scheduled_jobs (
 ```
 
 ## Roadmap
+Focus for now is making sure everything is tight and working as expected and handles failures gracefully
 
-Coming soon:
-- Job execution via ThreadPoolExecutor
+Strong maybe:
+- Job execution via ThreadPoolExecutor (you can actually already run on a thread with asyncio.to_thread)
 - Job execution via ProcessPoolExecutor
-- Job dependency management
 
 ## Installation
 
