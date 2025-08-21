@@ -20,6 +20,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class JobPriority(Enum):
+    # TODO: Implement enums at DB level
     """User-friendly job priority levels"""
     NORMAL = "normal"      # Default priority (value: 5)
     CRITICAL = "critical"  # High priority (value: 1) - lower numbers = higher priority
@@ -44,7 +45,6 @@ class ConflictResolution(Enum):
 class Scheduler:
     HEARTBEAT_THRESHOLD = 120  # 2 minutes (in seconds)
     LEASE_DURATION = 60        # 1 minute lease duration (in seconds)
-    MAX_RETRY_ATTEMPTS = 3     # For database operations
     WORKER_ID_LENGTH = 8       # For worker identification
 
     def __init__(self, 
@@ -70,6 +70,7 @@ class Scheduler:
         # Concurrency control with tracking
         self.job_semaphore = asyncio.Semaphore(max_concurrent_jobs)
         self.active_jobs: Set[str] = set()  # Track active job IDs
+        self.active_tasks: Set[asyncio.Task] = set()  # Track active asyncio tasks
         
         # Job expiration policy
         self.misfire_grace_time = misfire_grace_time
@@ -145,6 +146,20 @@ class Scheduler:
             
             if self.active_jobs:
                 logger.warning(f"Timed out waiting for jobs {self.active_jobs} to complete")
+        
+        # Wait for any remaining active tasks to complete or cancel them
+        if self.active_tasks:
+            logger.info(f"Waiting for {len(self.active_tasks)} active tasks to complete...")
+            await asyncio.wait(self.active_tasks, timeout=10, return_when=asyncio.ALL_COMPLETED)
+            
+            # Cancel any tasks that didn't complete
+            remaining_tasks = [task for task in self.active_tasks if not task.done()]
+            if remaining_tasks:
+                logger.warning(f"Cancelling {len(remaining_tasks)} remaining tasks")
+                for task in remaining_tasks:
+                    task.cancel()
+                # Wait for cancellation to complete
+                await asyncio.gather(*remaining_tasks, return_exceptions=True)
         
         # Clean up background tasks
         await self._cleanup_background_tasks()
@@ -354,12 +369,12 @@ class Scheduler:
         return scheduled_job_id
 
     async def listen_for_jobs(self):
-        """Listen for jobs with enhanced reliability and conservative semaphore management"""
+        """Listen for jobs with reliability"""
         
         startup_jitter = random.uniform(0, 1.0)
         await asyncio.sleep(startup_jitter)
         
-        logger.info(f"Starting reliable job listener [worker={self.worker_id}]")
+        logger.info(f"Starting job listener [worker={self.worker_id}]")
         
         while self.is_running and not self.is_shutting_down:
             try:
@@ -372,21 +387,22 @@ class Scheduler:
                 # Claim only 1 job at a time to prevent semaphore race conditions
                 # TODO: Maybe add tie breaker
                 # TODO: Maybe revert to bulk claim here once we find a safe way to do it
-                ready_jobs = await self.claim_jobs_with_slots(1)
+                ready_jobs = await self._claim_jobs(1)
                 
                 if ready_jobs:
                     logger.info(f"Claimed {len(ready_jobs)} jobs [worker={self.worker_id}] (conservative claiming)")
-
+ 
                     for job_row in ready_jobs:
                         if not self.is_running:
                             break
-                        # Use the original execute method with proper semaphore handling
-                        asyncio.create_task(self.execute_job_with_concurrency_control(job_row))
+                        task = asyncio.create_task(self.execute_job_with_concurrency_control(job_row))
+                        self.active_tasks.add(task)
+                        task.add_done_callback(self.active_tasks.discard)
                 
                 # Adaptive sleep
                 if ready_jobs:
                     jitter = random.uniform(-0.05, 0.05)
-                    await asyncio.sleep(0.1 + jitter)
+                    await asyncio.sleep(0.05 + jitter)
                 else:
                     jitter = random.uniform(-0.2, 0.2)
                     await asyncio.sleep(2.0 + jitter)
@@ -395,67 +411,8 @@ class Scheduler:
                 logger.error(f"Error in job listener: {e}")
                 await asyncio.sleep(5)
 
-    async def claim_jobs_atomically(self):
-        """Claim jobs atomically with lease-based reliability"""
-        available_slots = self.job_semaphore._value
-        if available_slots <= 0:
-            return []
-        
-        try:
-            # Use a transaction for atomic job claiming
-            async with self.db_pool.acquire() as conn:
-                async with conn.transaction():
-                    # Calculate expiration cutoff for misfire grace time
-                    current_time = datetime.datetime.now(UTC)
-                    expiration_cutoff = current_time - datetime.timedelta(seconds=self.misfire_grace_time)
-                    
-                    # Expire old jobs that are past the misfire grace time
-                    expired_jobs = await conn.fetch("""
-                        UPDATE scheduled_jobs 
-                        SET status = 'expired', worker_id = $1
-                        WHERE status = 'pending' 
-                        AND execution_time < $2
-                        RETURNING job_id, job_name, execution_time;
-                    """, self.worker_id, expiration_cutoff)
-                    
-                    if expired_jobs:
-                        logger.warning(f"Expired {len(expired_jobs)} jobs past grace time")
-                    
-                    # Claim ready jobs atomically using CTE pattern
-                    ready_jobs = await conn.fetch("""
-                        WITH to_claim AS (
-                            SELECT job_id
-                            FROM scheduled_jobs
-                            WHERE status = 'pending'
-                            AND execution_time <= NOW()  -- ready to execute
-                            AND (lease_until IS NULL OR lease_until < NOW())  -- not currently leased
-                            ORDER BY priority ASC, execution_time ASC, job_id ASC
-                            FOR UPDATE SKIP LOCKED
-                            LIMIT $1
-                        )
-                        UPDATE scheduled_jobs j
-                        SET status = 'running',
-                            last_heartbeat = NOW(),
-                            lease_until = NOW() + INTERVAL '60 seconds',
-                            worker_id = $2
-                        FROM to_claim c
-                        WHERE j.job_id = c.job_id
-                        RETURNING j.job_id, j.job_name, j.execution_time, j.task_data::text,
-                                  j.priority, j.retry_count, j.max_retries;
-                    """, min(3, available_slots), self.worker_id)
-                    
-                    # Track claimed jobs
-                    for job in ready_jobs:
-                        self.active_jobs.add(job['job_id'])
-                    
-                    return ready_jobs
-                    
-        except Exception as e:
-            logger.error(f"Error claiming jobs atomically: {e}")
-            return []
-
-    async def claim_jobs_with_slots(self, num_slots: int):
-        """Claim jobs from database when we already have semaphore slots reserved"""
+    async def _claim_jobs(self, num_slots: int):
+        """Claim jobs from database"""
         try:
             # Use a transaction for atomic job claiming
             async with self.db_pool.acquire() as conn:
