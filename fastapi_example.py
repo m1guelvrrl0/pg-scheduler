@@ -29,7 +29,7 @@ async def lifespan(app: FastAPI):
     )
     await app.state.scheduler.start()
     yield
-    await app.state.scheduler.stop()
+    await app.state.scheduler.shutdown()
     await app.state.db_pool.close()
 
 
