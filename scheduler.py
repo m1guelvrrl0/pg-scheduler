@@ -82,6 +82,7 @@ class Scheduler:
         
         # Setup signal handlers for graceful shutdown
         self._setup_signal_handlers()
+        self.shutdown_task = None
         
         logger.info(f"Scheduler initialized: worker_id={self.worker_id}, "
                    f"max_concurrent={max_concurrent_jobs}, misfire_grace={misfire_grace_time}s")
@@ -95,7 +96,7 @@ class Scheduler:
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully"""
         logger.info(f"Received signal {signum}, initiating graceful shutdown...")
-        asyncio.create_task(self.shutdown())
+        self.shutdown_task = asyncio.create_task(self.shutdown())
 
     async def start(self):
         """Start the scheduler with reliability features"""
