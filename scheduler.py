@@ -7,9 +7,10 @@ import signal
 import sys
 from job import Job, JobStatus
 import inspect
-from datetime import UTC
-from typing import Optional, Set
+from datetime import UTC, timedelta
+from typing import Optional, Set, Dict
 from enum import Enum
+from dataclasses import dataclass
 import uuid
 import random
 
@@ -42,6 +43,58 @@ class ConflictResolution(Enum):
     IGNORE = "ignore"      # Ignore the new job, return existing job_id  
     REPLACE = "replace"    # Replace/update the existing job with new parameters
 
+class VacuumTrigger(Enum):
+    """Vacuum policy trigger types"""
+    IMMEDIATE = "immediate"      # Delete immediately on status change
+    TIME_BASED = "time_based"    # Delete after X time
+    COUNT_BASED = "count_based"  # Keep only last N jobs
+    NEVER = "never"              # No automatic cleanup
+
+@dataclass
+class VacuumPolicy:
+    """Configuration for a vacuum policy"""
+    trigger: VacuumTrigger
+    days: Optional[int] = None           # For TIME_BASED policies
+    keep_count: Optional[int] = None     # For COUNT_BASED policies
+    
+    @classmethod
+    def immediate(cls) -> 'VacuumPolicy':
+        """Delete immediately when job reaches this status"""
+        return cls(VacuumTrigger.IMMEDIATE)
+        
+    @classmethod  
+    def after_days(cls, days: int) -> 'VacuumPolicy':
+        """Delete jobs after N days in this status"""
+        return cls(VacuumTrigger.TIME_BASED, days=days)
+        
+    @classmethod
+    def keep_last(cls, count: int) -> 'VacuumPolicy':
+        """Keep only the last N jobs per job_name in this status"""
+        return cls(VacuumTrigger.COUNT_BASED, keep_count=count)
+        
+    @classmethod
+    def never(cls) -> 'VacuumPolicy':
+        """Never automatically clean jobs in this status"""
+        return cls(VacuumTrigger.NEVER)
+
+@dataclass
+class VacuumConfig:
+    """Complete vacuum configuration for the scheduler"""
+    completed: VacuumPolicy = None       # Will default to after_days(1)
+    failed: VacuumPolicy = None          # Will default to after_days(7)  
+    cancelled: VacuumPolicy = None       # Will default to after_days(3)
+    interval_minutes: int = 60           # How often to run vacuum
+    track_metrics: bool = False          # Whether to store vacuum metrics in DB
+    
+    def __post_init__(self):
+        """Set sensible defaults for None policies"""
+        if self.completed is None:
+            self.completed = VacuumPolicy.after_days(1)
+        if self.failed is None:
+            self.failed = VacuumPolicy.after_days(7)
+        if self.cancelled is None:
+            self.cancelled = VacuumPolicy.after_days(3)
+
 class Scheduler:
     HEARTBEAT_THRESHOLD = 120  # 2 minutes (in seconds)
     LEASE_DURATION = 60        # 1 minute lease duration (in seconds)
@@ -49,8 +102,10 @@ class Scheduler:
 
     def __init__(self, 
                  db_pool: asyncpg.Pool, 
-                 max_concurrent_jobs: int = 10, 
-                 misfire_grace_time: int = 300):  # 5 minutes default
+                 max_concurrent_jobs: int = 25, 
+                 misfire_grace_time: int = 300,  # 5 minutes default
+                 vacuum_config: Optional[VacuumConfig] = None,
+                 vacuum_enabled: bool = True):
         """
         Initialize the Scheduler with concurrency control and reliability features.
         
@@ -58,6 +113,8 @@ class Scheduler:
             db_pool: Connection to the PostgreSQL database.
             max_concurrent_jobs: Maximum number of jobs to run concurrently
             misfire_grace_time: Seconds after execution_time before jobs expire (like APScheduler)
+            vacuum_config: Configuration for job cleanup policies (uses defaults if None)
+            vacuum_enabled: Whether to enable automatic vacuum cleanup
         """
         self.db_pool = db_pool
         self.task_map = {}  # Store task functions
@@ -75,10 +132,15 @@ class Scheduler:
         # Job expiration policy
         self.misfire_grace_time = misfire_grace_time
         
+        # Vacuum configuration
+        self.vacuum_enabled = vacuum_enabled
+        self.vacuum_config = vacuum_config or VacuumConfig()
+        
         # Background tasks
         self.heartbeat_monitor_task = None
         self.listener_task = None
         self.orphan_recovery_task = None
+        self.vacuum_task = None
         
         # Setup signal handlers for graceful shutdown
         self._setup_signal_handlers()
@@ -119,7 +181,12 @@ class Scheduler:
             self.orphan_recovery_task = asyncio.create_task(self.periodic_orphan_recovery())
             self.listener_task = asyncio.create_task(self.listen_for_jobs())
             
-            logger.info(f"Scheduler started: worker_id={self.worker_id}")
+            # Start vacuum task if enabled
+            if self.vacuum_enabled:
+                self.vacuum_task = asyncio.create_task(self._vacuum_loop())
+                logger.info(f"Scheduler started: worker_id={self.worker_id}, vacuum_enabled=True")
+            else:
+                logger.info(f"Scheduler started: worker_id={self.worker_id}, vacuum_enabled=False")
             
         except Exception as e:
             logger.error(f"Error starting scheduler: {e}")
@@ -172,7 +239,7 @@ class Scheduler:
 
     async def _cleanup_background_tasks(self):
         """Clean up all background tasks"""
-        tasks = [self.heartbeat_monitor_task, self.listener_task, self.orphan_recovery_task]
+        tasks = [self.heartbeat_monitor_task, self.listener_task, self.orphan_recovery_task, self.vacuum_task]
         for task in tasks:
             if task and not task.done():
                 task.cancel()
@@ -245,7 +312,21 @@ class Scheduler:
             WHERE worker_id IS NOT NULL;
         """)
         
-        logger.info("Database initialized with reliability features")
+        # Create vacuum statistics table if metrics tracking is enabled
+        if self.vacuum_config.track_metrics:
+            await self._execute_with_retry("""
+                CREATE TABLE IF NOT EXISTS vacuum_stats (
+                    stat_date DATE PRIMARY KEY DEFAULT CURRENT_DATE,
+                    deleted_completed INTEGER DEFAULT 0,
+                    deleted_failed INTEGER DEFAULT 0,
+                    deleted_cancelled INTEGER DEFAULT 0,
+                    last_run TIMESTAMPTZ,
+                    worker_id TEXT  -- Track which worker performed the vacuum
+                );
+            """)
+            logger.info("Database initialized with reliability features and vacuum metrics")
+        else:
+            logger.info("Database initialized with reliability features")
 
     async def _execute_with_retry(self, query: str, *args, max_retries: int = 3):
         """Execute database query with retry logic for transient failures"""
@@ -370,7 +451,7 @@ class Scheduler:
         return scheduled_job_id
 
     async def listen_for_jobs(self):
-        """Listen for jobs with reliability"""
+        """Listen for jobs with reliability and optimized bulk claiming"""
         
         startup_jitter = random.uniform(0, 1.0)
         await asyncio.sleep(startup_jitter)
@@ -379,20 +460,21 @@ class Scheduler:
         
         while self.is_running and not self.is_shutting_down:
             try:
-                # only claim jobs when semaphore definitely has slots
+                # Check available semaphore slots
                 available_slots = self.job_semaphore._value
                 if available_slots <= 0:
                     await asyncio.sleep(1.0)
                     continue
                 
-                # Claim only 1 job at a time to prevent semaphore race conditions
-                # TODO: Maybe add tie breaker
-                # TODO: Maybe revert to bulk claim here once we find a safe way to do it
-                ready_jobs = await self._claim_jobs(1)
+                max_claimable = min(available_slots, 5)  # Cap at 5 for reasonable batch size
+                
+                # Claim jobs from database
+                ready_jobs = await self._claim_jobs(max_claimable)
                 
                 if ready_jobs:
-                    logger.info(f"Claimed {len(ready_jobs)} jobs [worker={self.worker_id}] (conservative claiming)")
- 
+                    logger.info(f"Claimed {len(ready_jobs)} jobs [worker={self.worker_id}] (bulk claiming)")
+                    
+                    # The semaphore will naturally limit concurrency
                     for job_row in ready_jobs:
                         if not self.is_running:
                             break
@@ -401,6 +483,8 @@ class Scheduler:
                         task.add_done_callback(self.active_tasks.discard)
                 
                 # Adaptive sleep
+                # TODO: Maybe find a smarter way to do this ie exponential backoff strategy or something
+                #
                 if ready_jobs:
                     jitter = random.uniform(-0.05, 0.05)
                     await asyncio.sleep(0.05 + jitter)
@@ -467,16 +551,14 @@ class Scheduler:
             logger.error(f"Error claiming jobs with slots: {e}")
             return []
 
-
-
     async def execute_job_with_concurrency_control(self, job_row):
-        """Execute job with full reliability and proper resource management"""
+        """Execute job with semaphore control"""
         job_id = job_row['job_id']
         
         # Ensure semaphore is always released
         try:
             async with self.job_semaphore:
-                await self.execute_job_with_reliability(job_row)
+                await self.execute_job(job_row)
         except Exception as e:
             logger.error(f"Critical error in job {job_id} execution: {e}")
             # Ensure job is properly marked as failed
@@ -485,7 +567,9 @@ class Scheduler:
             # Always remove from active jobs tracking
             self.active_jobs.discard(job_id)
 
-    async def execute_job_with_reliability(self, job_row):
+
+
+    async def execute_job(self, job_row):
         """Execute job with comprehensive error handling and state management"""
         job_id = job_row['job_id']
         job_name = job_row['job_name']
@@ -677,6 +761,117 @@ class Scheduler:
                 logger.error(f"Heartbeat failed for job {job_id}: {e}")
                 await asyncio.sleep(30)
 
+    async def _vacuum_loop(self):
+        """Background vacuum task that periodically cleans up jobs based on policies"""
+        while self.is_running and not self.is_shutting_down:
+            try:
+                await self._run_vacuum_policies()
+                await asyncio.sleep(self.vacuum_config.interval_minutes * 60)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Vacuum task error: {e}")
+                await asyncio.sleep(60)  # Retry after error
+
+    async def _run_vacuum_policies(self):
+        """Execute vacuum policies"""
+        # Safety window: Never vacuum jobs that are actively running or recently updated
+        safety_window = datetime.datetime.now(UTC) - timedelta(minutes=5)
+        
+        total_deleted = 0
+        for status, policy in [
+            ('completed', self.vacuum_config.completed),
+            ('failed', self.vacuum_config.failed), 
+            ('cancelled', self.vacuum_config.cancelled)
+        ]:
+            if policy.trigger == VacuumTrigger.NEVER:
+                continue
+                
+            deleted_count = await self._apply_vacuum_policy(status, policy, safety_window)
+            total_deleted += deleted_count
+            
+            if deleted_count > 0:
+                logger.info(f"Vacuum: deleted {deleted_count} {status} jobs")
+        
+        if total_deleted > 0:
+            logger.info(f"Vacuum completed: deleted {total_deleted} total jobs")
+
+    async def _apply_vacuum_policy(self, status: str, policy: VacuumPolicy, safety_window: datetime.datetime) -> int:
+        """Apply a specific vacuum policy and return count of deleted jobs"""
+        try:
+            if policy.trigger == VacuumTrigger.IMMEDIATE:
+                # Delete all jobs in this status (respecting safety window)
+                # NULL heartbeat means job is not active, so it's safe to delete
+                query = """
+                    DELETE FROM scheduled_jobs 
+                    WHERE status = $1 AND (last_heartbeat IS NULL OR last_heartbeat < $2)
+                    RETURNING job_id;
+                """
+                deleted_jobs = await self._execute_with_retry(query, status, safety_window)
+                
+            elif policy.trigger == VacuumTrigger.TIME_BASED:
+                # Delete jobs older than specified days
+                cutoff_time = datetime.datetime.now(UTC) - timedelta(days=policy.days)
+                query = """
+                    DELETE FROM scheduled_jobs 
+                    WHERE status = $1 AND created_at < $2 AND (last_heartbeat IS NULL OR last_heartbeat < $3)
+                    RETURNING job_id;
+                """
+                deleted_jobs = await self._execute_with_retry(query, status, cutoff_time, safety_window)
+                
+            elif policy.trigger == VacuumTrigger.COUNT_BASED:
+                # Keep only the last N jobs per job_name
+                query = """
+                    DELETE FROM scheduled_jobs 
+                    WHERE job_id IN (
+                        SELECT job_id FROM (
+                            SELECT job_id, 
+                                   ROW_NUMBER() OVER (PARTITION BY job_name ORDER BY created_at DESC) as rn
+                            FROM scheduled_jobs 
+                            WHERE status = $1 AND (last_heartbeat IS NULL OR last_heartbeat < $2)
+                        ) ranked 
+                        WHERE rn > $3
+                    )
+                    RETURNING job_id;
+                """
+                deleted_jobs = await self._execute_with_retry(query, status, safety_window, policy.keep_count)
+                
+            else:
+                deleted_jobs = []
+            
+            deleted_count = len(deleted_jobs)
+            
+            # Record metrics if enabled
+            if deleted_count > 0 and self.vacuum_config.track_metrics:
+                await self._record_vacuum_metrics(status, deleted_count)
+                
+            return deleted_count
+            
+        except Exception as e:
+            logger.error(f"Error applying vacuum policy for {status} jobs: {e}")
+            return 0
+
+    async def _record_vacuum_metrics(self, status: str, deleted_count: int):
+        """Record vacuum metrics in the database"""
+        try:
+            await self._execute_with_retry("""
+                INSERT INTO vacuum_stats (stat_date, deleted_completed, deleted_failed, deleted_cancelled, last_run, worker_id)
+                VALUES (CURRENT_DATE, 
+                        CASE WHEN $1 = 'completed' THEN $2 ELSE 0 END,
+                        CASE WHEN $1 = 'failed' THEN $2 ELSE 0 END,
+                        CASE WHEN $1 = 'cancelled' THEN $2 ELSE 0 END,
+                        NOW(), $3)
+                ON CONFLICT (stat_date) 
+                DO UPDATE SET 
+                    deleted_completed = vacuum_stats.deleted_completed + EXCLUDED.deleted_completed,
+                    deleted_failed = vacuum_stats.deleted_failed + EXCLUDED.deleted_failed,
+                    deleted_cancelled = vacuum_stats.deleted_cancelled + EXCLUDED.deleted_cancelled,
+                    last_run = EXCLUDED.last_run,
+                    worker_id = EXCLUDED.worker_id;
+            """, status, deleted_count, self.worker_id)
+        except Exception as e:
+            logger.error(f"Failed to record vacuum metrics: {e}")
+
     async def schedule_job(self, job_name, execution_time, task_data, priority: JobPriority = JobPriority.NORMAL, max_retries: int = 0, job_id: Optional[str] = None, conflict_resolution: ConflictResolution = ConflictResolution.RAISE) -> str:
         """
         Schedule a job by inserting it into the 'scheduled_jobs' table.
@@ -824,3 +1019,95 @@ class Scheduler:
             SET status = $1
             WHERE job_id = $2;
         """, status.value, job_id)
+
+    # Vacuum API Methods
+    
+    async def run_vacuum(self) -> Dict[str, int]:
+        """
+        Manually trigger vacuum policies and return statistics.
+        
+        Returns:
+            Dict with counts of deleted jobs by status
+        """
+        if not self.vacuum_enabled:
+            logger.warning("Vacuum is disabled - no cleanup performed")
+            return {"completed": 0, "failed": 0, "cancelled": 0}
+            
+        # Safety window for manual vacuum
+        safety_window = datetime.datetime.now(UTC) - timedelta(minutes=5)
+        
+        results = {}
+        for status, policy in [
+            ('completed', self.vacuum_config.completed),
+            ('failed', self.vacuum_config.failed), 
+            ('cancelled', self.vacuum_config.cancelled)
+        ]:
+            if policy.trigger == VacuumTrigger.NEVER:
+                results[status] = 0
+                continue
+                
+            deleted_count = await self._apply_vacuum_policy(status, policy, safety_window)
+            results[status] = deleted_count
+            
+            if deleted_count > 0:
+                logger.info(f"Manual vacuum: deleted {deleted_count} {status} jobs")
+        
+        total = sum(results.values())
+        if total > 0:
+            logger.info(f"Manual vacuum completed: deleted {total} total jobs")
+        
+        return results
+
+    async def get_vacuum_stats(self, days: int = 7) -> list:
+        """
+        Get vacuum statistics for the last N days (requires track_metrics=True).
+        
+        Args:
+            days: Number of days to look back
+            
+        Returns:
+            List of vacuum statistics records
+        """
+        if not self.vacuum_config.track_metrics:
+            logger.warning("Vacuum metrics tracking is disabled - no stats available")
+            return []
+            
+        try:
+            return await self._execute_with_retry("""
+                SELECT stat_date, 
+                       deleted_completed, 
+                       deleted_failed, 
+                       deleted_cancelled,
+                       last_run,
+                       worker_id
+                FROM vacuum_stats 
+                WHERE stat_date >= CURRENT_DATE - make_interval(days => $1)
+                ORDER BY stat_date DESC;
+            """, days)
+        except Exception as e:
+            logger.error(f"Error fetching vacuum stats: {e}")
+            return []
+
+    async def get_total_vacuum_stats(self) -> dict:
+        """
+        Get aggregated vacuum statistics across all time and workers (requires track_metrics=True).
+        
+        Returns:
+            Dict with total counts and last vacuum run time
+        """
+        if not self.vacuum_config.track_metrics:
+            logger.warning("Vacuum metrics tracking is disabled - no stats available")
+            return {}
+            
+        try:
+            result = await self._execute_with_retry("""
+                SELECT SUM(deleted_completed) as total_completed,
+                       SUM(deleted_failed) as total_failed, 
+                       SUM(deleted_cancelled) as total_cancelled,
+                       MAX(last_run) as last_vacuum_run
+                FROM vacuum_stats;
+            """)
+            return dict(result[0]) if result else {}
+        except Exception as e:
+            logger.error(f"Error fetching total vacuum stats: {e}")
+            return {}
