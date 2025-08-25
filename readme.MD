@@ -2,7 +2,7 @@
 
 A simple lightweight async first job scheduler for Python that uses Postgresql to allow you to schedule and manage the execution of asynchronous tasks.
 
-It's heavily inspired by APScheduler in its user friendly API but horizontally scalable and much more focused in the features it provides and technologies it uses.
+It's heavily inspired by APScheduler in its API but horizontally scalable and much more focused in the features it provides and technologies it uses.
 
 It makes minimal assumptions about how you run it other than that you are in an asyncIO enviroment, use Postgresql and asyncpg. Due to this it can integrate very easily with other technologies.
 
