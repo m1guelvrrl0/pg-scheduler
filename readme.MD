@@ -1,6 +1,10 @@
-# Python Job Scheduler
+# Python PG backed Job Scheduler
 
-A simple lightweight async first job scheduler for Python that allows you to schedule and manage the execution of asynchronous tasks.
+A simple lightweight async first job scheduler for Python that uses Postgresql to allow you to schedule and manage the execution of asynchronous tasks.
+It's heavily inspired by APScheduler in its user friendly API but horizontally scalable and much more focused in the features it provides and technologies it uses.
+It makes minimal assumptions about how you run it other than that you are in an asyncIO enviroment, use Postgresql and asyncpg. Due to this it can integrate very easily with other technologies.
+
+This library is focused on easy to use and deploy scheduler and not being an all comprehensive job runner so if you need something more advanced and complicated like workers queues and worker producer patterns I believe these are already very well covered in the python ecosystem and I would suggest you to look at those instead.
 
 ## Features
 
