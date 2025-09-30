@@ -287,6 +287,13 @@ VACUUM_ENABLED=true
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
+## 📋 TODO / Roadmap
+
+### Planned Features
+
+- **Cron-like Scheduling**: Support for cron expressions (e.g., `@periodic(cron="0 0 * * SUN")` for "every Sunday at midnight")
+- **Timezone Support**: Specify timezones for periodic jobs
+
 ## 📄 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
