@@ -4,7 +4,16 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/pg-scheduler.svg)](https://pypi.org/project/pg-scheduler/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A robust, production-ready job scheduler built on PostgreSQL with async I/O support, designed for high-throughput applications with reliability and concurrency control.
+A simple lightweight async first job scheduler for Python that uses PostgreSQL to allow you to schedule and manage the execution of asynchronous tasks.
+
+It's heavily inspired by APScheduler in its API but horizontally scalable and much more focused in the features it provides and technologies it uses.
+
+## ⚠️ Project Status
+
+This project is currently in **early development** (v0.1.0). While functional, please note:
+- The API may change in future versions
+- Recommended for testing and development environments
+- Production use should be carefully evaluated
 
 ## ✨ Key Features
 
