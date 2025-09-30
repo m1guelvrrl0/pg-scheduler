@@ -1,0 +1,59 @@
+# Changelog
+
+All notable changes to PG Scheduler will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.1.0] - 2025-09-29
+
+### Added
+
+#### Core Features
+- **Job Scheduler**: PostgreSQL-based async job scheduling system
+- **Periodic Jobs**: `@periodic` decorator for recurring tasks with automatic registration
+- **Deduplication**: Cross-replica job deduplication using deterministic job IDs
+- **Self-rescheduling**: Automatic rescheduling of periodic jobs after completion
+- **Priority System**: Support for `JobPriority.NORMAL` and `JobPriority.CRITICAL`
+- **Retry Logic**: Configurable retry attempts with exponential backoff
+
+#### Reliability Features
+- **Heartbeat Monitoring**: Detect and recover from crashed workers
+- **Orphan Recovery**: Automatic cleanup of abandoned jobs
+- **Graceful Shutdown**: Wait for active jobs to complete before stopping
+- **Lease-based Execution**: Explicit job ownership with timeouts
+- **Atomic Job Claiming**: Race-condition-free job distribution
+
+#### Advanced Features
+- **Advisory Locks**: Optional PostgreSQL advisory locks for exclusive execution
+- **Vacuum Policies**: Configurable cleanup policies for job lifecycle management
+- **Conflict Resolution**: Flexible strategies for handling duplicate job IDs
+- **Job Management API**: Runtime control of periodic jobs (enable/disable/trigger)
+
+#### Production Features
+- **Multi-replica Support**: Safe deployment across multiple worker instances
+- **Comprehensive Logging**: Detailed logging with worker identification
+- **Error Handling**: Robust error handling and recovery mechanisms
+- **Database Optimization**: Efficient queries and indexing strategies
+
+### Documentation
+- Comprehensive README with installation and usage examples
+- API documentation for all major components
+- Production deployment guidelines
+- Docker and Kubernetes configuration examples
+- Performance tuning recommendations
+
+### Examples
+- Basic job scheduling examples
+- Periodic job patterns and best practices
+- Production configuration templates
+- Integration examples (FastAPI, Django)
+
+### Technical Details
+- **Python Support**: 3.9+
+- **PostgreSQL Support**: 12+
+- **Dependencies**: asyncpg for database connectivity
+- **Architecture**: Async/await throughout for maximum performance
+- **Database Schema**: Optimized table structure with proper indexing
+
+[0.1.0]: https://github.com/miguelrebelo/pg-scheduler/releases/tag/v0.1.0

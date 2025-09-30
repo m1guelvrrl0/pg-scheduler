@@ -26,4 +26,6 @@ services:
       - DATABASE_URL=postgresql://scheduler:scheduler123@db:5432/scheduler_db
     volumes:
       - .:/app
-    command: python example.py
+    ports:
+      - "8000:8000"
+    command: python fastapi_example.py

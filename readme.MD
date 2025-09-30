@@ -1,60 +1,54 @@
-# Python PG backed Job Scheduler
+# PG Scheduler
 
-A simple lightweight async first job scheduler for Python that uses Postgresql to allow you to schedule and manage the execution of asynchronous tasks.
+[![PyPI version](https://badge.fury.io/py/pg-scheduler.svg)](https://badge.fury.io/py/pg-scheduler)
+[![Python versions](https://img.shields.io/pypi/pyversions/pg-scheduler.svg)](https://pypi.org/project/pg-scheduler/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-It's heavily inspired by APScheduler in its API but horizontally scalable and much more focused in the features it provides and technologies it uses.
+A robust, production-ready job scheduler built on PostgreSQL with async I/O support, designed for high-throughput applications with reliability and concurrency control.
 
-It makes minimal assumptions about how you run it other than that you are in an asyncIO enviroment, use Postgresql and asyncpg. Due to this it can integrate very easily with other technologies.
+## ✨ Key Features
 
-This library is focused on easy to use and deploy scheduler and not being an all comprehensive job runner so if you need something more advanced and complicated like workers queues and worker producer patterns I believe these are already very well covered in the python ecosystem and I would suggest you to look at those instead.
+- **🔄 Periodic Jobs**: Simple `@periodic` decorator for recurring tasks
+- **🔒 Deduplication**: Guarantees exactly one execution per window across replicas  
+- **⚡ Self-Rescheduling**: Jobs automatically schedule their next execution
+- **🛡️ Advisory Locks**: Optional PostgreSQL advisory locks for exclusive execution
+- **🎯 Priority Queues**: Support for job priorities and retry logic
+- **🧹 Vacuum Policies**: Automatic cleanup of completed jobs
+- **💪 Reliability**: Graceful shutdown, error handling, and orphan recovery
 
-## Features
+## 📦 Installation
 
-- Schedule async functions to run at specific times or intervals
-- Supports one-time and recurring jobs
-- Async-first design - works with modern async/await syntax
-- Simple and lightweight implementation
+```bash
+pip install pg-scheduler
+```
 
-## ⚠️ Project Status
-
-This project is currently in **alpha** stage and not ready to be used. Please note:
-- The API is not stable and may change without notice
-- Currently only supports async functions
-- Not recommended for production use without thorough testing
-
-## Requirements
+### Requirements
 
 - Python 3.9+
 - PostgreSQL 12+
+- asyncpg
 
-## Quick Start
+## 🚀 Quick Start
+
+### Basic Job Scheduling
 
 ```python
 import asyncio
 import asyncpg
 from datetime import datetime, timedelta, UTC
-from scheduler import Scheduler, JobPriority, ConflictResolution
+from pg_scheduler import Scheduler, JobPriority
 
-# Define your async job functions
 async def send_email(recipient: str, subject: str):
-    """Example job: Send an email"""
+    """Example job function"""
     print(f"📧 Sending email to {recipient}: {subject}")
-    # Your email sending logic here
-    await asyncio.sleep(1)  # Simulate work
+    await asyncio.sleep(1)  # Simulate async work
     print(f"✅ Email sent to {recipient}")
-
-async def generate_report(report_type: str, user_id: int):
-    """Example job: Generate a report"""
-    print(f"📊 Generating {report_type} report for user {user_id}")
-    # Your report generation logic here
-    await asyncio.sleep(2)  # Simulate work
-    print(f"✅ Report generated: {report_type}")
 
 async def main():
     # Create database connection pool
     db_pool = await asyncpg.create_pool(
         user='scheduler',
-        password='scheduler123',
+        password='password',
         database='scheduler_db',
         host='localhost',
         port=5432
@@ -65,56 +59,20 @@ async def main():
     await scheduler.start()
     
     try:
-        # 1. Schedule job with auto-generated ID
-        job_id1 = await scheduler.schedule(
+        # Schedule a job
+        job_id = await scheduler.schedule(
             send_email,
             execution_time=datetime.now(UTC) + timedelta(minutes=5),
-            args=("user@example.com", "Welcome!")
-        )
-        print(f"Scheduled email job: {job_id1}")
-        
-        # 2. Schedule job with custom ID
-        job_id2 = await scheduler.schedule(
-            generate_report,
-            execution_time=datetime.now(UTC) + timedelta(hours=1),
-            args=("monthly", 123),
-            job_id="monthly-report-2024-08",
-            priority=JobPriority.CRITICAL,
+            args=("user@example.com", "Welcome!"),
+            priority=JobPriority.NORMAL,
             max_retries=3
         )
-        print(f"Scheduled report job: {job_id2}")
+        print(f"Scheduled job: {job_id}")
         
-        # 3. Schedule with conflict resolution
-        # This will ignore the duplicate and return existing job_id
-        job_id3 = await scheduler.schedule(
-            generate_report,
-            execution_time=datetime.now(UTC) + timedelta(hours=2),
-            args=("monthly", 456),
-            job_id="monthly-report-2024-08",  # Same ID as above
-            conflict_resolution=ConflictResolution.IGNORE
-        )
-        print(f"Duplicate job ignored: {job_id3}")
-        
-        # 4. Cancel a scheduled job
-        cancelled = await scheduler.cancel_job(job_id1)
-        if cancelled:
-            print(f"Job {job_id1} cancelled successfully")
-        
-        # 5. Replace/update an existing job
-        job_id4 = await scheduler.schedule(
-            generate_report,
-            execution_time=datetime.now(UTC) + timedelta(minutes=30),
-            args=("weekly", 789),
-            job_id="monthly-report-2024-08",  # Same ID, but will replace
-            conflict_resolution=ConflictResolution.REPLACE
-        )
-        print(f"Job replaced: {job_id4}")
-        
-        # Let the scheduler run for a while
-        await asyncio.sleep(10)
+        # Keep running
+        await asyncio.sleep(300)  # Run for 5 minutes
         
     finally:
-        # Clean shutdown
         await scheduler.shutdown()
         await db_pool.close()
 
@@ -122,36 +80,147 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-## Key Features
+### Periodic Jobs with @periodic Decorator
 
-### 🎯 **Job Scheduling**
-- **Auto-generated IDs**: Let the system create unique job IDs
-- **Custom IDs**: Provide your own job IDs for idempotent operations
-- **Priority Support**: `JobPriority.NORMAL` (default) or `JobPriority.CRITICAL`
-- **Retry Logic**: Configure `max_retries` (defaults to 0 for no retries)
+```python
+from datetime import timedelta
+from pg_scheduler import periodic, JobPriority
 
-### 🔄 **Conflict Resolution**
+@periodic(every=timedelta(minutes=15))
+async def cleanup_temp_files():
+    """Clean up temporary files every 15 minutes"""
+    print("🧹 Cleaning up temporary files...")
+    # Your cleanup logic here
+    print("✅ Cleanup completed")
+
+@periodic(every=timedelta(hours=1), priority=JobPriority.CRITICAL, max_retries=3)
+async def generate_hourly_report():
+    """Generate hourly reports with high priority and retries"""
+    print("📊 Generating hourly report...")
+    # Your report generation logic here
+    print("✅ Report generated")
+
+# Advisory locks for exclusive execution
+@periodic(every=timedelta(minutes=30), use_advisory_lock=True)
+async def exclusive_maintenance():
+    """Maintenance that should only run on one worker at a time"""
+    print("🔒 Running exclusive maintenance...")
+    # Your maintenance logic here
+    print("✅ Maintenance completed")
+```
+
+## 🔄 Periodic Jobs Features
+
+The `@periodic` decorator provides powerful recurring job functionality:
+
+- **Automatic Registration**: Jobs are automatically registered when decorated
+- **Deduplication**: Uses deterministic job IDs to prevent duplicate executions across replicas
+- **Self-rescheduling**: Automatically schedules the next execution after completion
+- **Advisory Locks**: Optional PostgreSQL advisory locks for exclusive execution
+- **Priority Support**: Use `JobPriority.NORMAL` or `JobPriority.CRITICAL`
+- **Retry Logic**: Configure `max_retries` for failed executions
+- **Management**: Enable/disable jobs dynamically
+
+### Decorator Parameters
+
+```python
+@periodic(
+    every=timedelta(minutes=15),        # Required: execution interval
+    use_advisory_lock=False,            # Optional: use advisory locks instead of dedup
+    priority=JobPriority.NORMAL,        # Optional: job priority
+    max_retries=0,                      # Optional: retry attempts on failure
+    job_name=None,                      # Optional: custom job name (auto-generated)
+    dedup_key=None,                     # Optional: custom dedup key (auto-generated)
+    enabled=True                        # Optional: whether job is enabled
+)
+```
+
+### Management API
+
+```python
+# Get all periodic jobs
+periodic_jobs = scheduler.get_periodic_jobs()
+
+# Get status of a specific job
+status = scheduler.get_periodic_job_status(dedup_key)
+
+# Enable/disable jobs
+scheduler.enable_periodic_job(dedup_key)
+scheduler.disable_periodic_job(dedup_key)
+
+# Manually trigger a job
+job_id = await scheduler.trigger_periodic_job(dedup_key)
+```
+
+## 🎯 Job Scheduling Features
+
+### Priority Support
+- `JobPriority.NORMAL` (default) or `JobPriority.CRITICAL`
+- Higher priority jobs execute first
+
+### Conflict Resolution
 Handle duplicate job IDs with flexible strategies:
 - `ConflictResolution.RAISE` (default): Raise error for duplicates
 - `ConflictResolution.IGNORE`: Ignore new job, return existing ID
 - `ConflictResolution.REPLACE`: Update existing job with new parameters
 
-### 🛑 **Job Management**
-- **Cancel Jobs**: `await scheduler.cancel_job(job_id)`
-- **Graceful Shutdown**: Waits for active jobs to complete
-- **Concurrency Control**: Limit concurrent job execution
+### Retry Logic
+- Configure `max_retries` for failed jobs
+- Exponential backoff between retries
+- Comprehensive error handling
 
-### 🔧 **Reliability Features**
+## 🧹 Vacuum Policies
+
+Automatic cleanup of completed jobs with flexible policies:
+
+```python
+from pg_scheduler import VacuumConfig, VacuumPolicy
+
+# Configure cleanup policies
+vacuum_config = VacuumConfig(
+    completed=VacuumPolicy.after_days(1),    # Clean completed jobs after 1 day
+    failed=VacuumPolicy.after_days(7),       # Keep failed jobs for 7 days
+    cancelled=VacuumPolicy.after_days(3),    # Clean cancelled jobs after 3 days
+    interval_minutes=60,                     # Run vacuum every hour
+    track_metrics=True                       # Store vacuum statistics
+)
+
+scheduler = Scheduler(db_pool, vacuum_config=vacuum_config)
+```
+
+## 🛡️ Reliability Features
+
+### Built-in Reliability
 - **Lease-based Execution**: Explicit job ownership with timeouts
 - **Heartbeat Monitoring**: Detect and recover from crashed workers
 - **Atomic Job Claiming**: Race-condition-free job distribution
 - **Orphan Recovery**: Automatic cleanup of abandoned jobs
+- **Graceful Shutdown**: Waits for active jobs to complete
 
-## Database Setup
+### Deduplication
+- **Cross-replica Safety**: Same job won't run twice across multiple workers
+- **Deterministic Job IDs**: Based on function signature and parameters
+- **Window-based Deduplication**: Prevents duplicate executions in time windows
+
+## 🔧 Configuration
+
+### Scheduler Options
+
+```python
+scheduler = Scheduler(
+    db_pool=db_pool,
+    max_concurrent_jobs=25,      # Maximum concurrent job execution
+    misfire_grace_time=300,      # Seconds before jobs expire (5 minutes)
+    vacuum_enabled=True,         # Enable automatic job cleanup
+    vacuum_config=vacuum_config  # Custom vacuum policies
+)
+```
+
+## 📊 Database Schema
+
+The scheduler automatically creates the required PostgreSQL table:
 
 ```sql
--- The scheduler automatically creates the required table
--- But you can also create it manually:
 CREATE TABLE scheduled_jobs (
     job_id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
     job_name TEXT NOT NULL,
@@ -169,17 +238,41 @@ CREATE TABLE scheduled_jobs (
 );
 ```
 
-## Roadmap
-Focus for now is making sure everything is tight and working as expected and handles failures gracefully
+## 🚀 Production Deployment
 
-Strong maybe:
-- Job execution via ThreadPoolExecutor (you can actually already run on a thread with asyncio.to_thread)
-- Job execution via ProcessPoolExecutor
+### Docker Example
 
-## Installation
+```dockerfile
+FROM python:3.11-slim
 
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+COPY . .
+CMD ["python", "app.py"]
 ```
 
-## License
+### Environment Variables
+
+```bash
+DATABASE_URL=postgresql://user:pass@localhost:5432/scheduler_db
+MAX_CONCURRENT_JOBS=25
+MISFIRE_GRACE_TIME=300
+VACUUM_ENABLED=true
+```
+
+## 🤝 Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+## 📄 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## 🔗 Links
+
+- **PyPI**: https://pypi.org/project/pg-scheduler/
+- **GitHub**: https://github.com/miguelrebelo/pg-scheduler
+- **Documentation**: https://github.com/miguelrebelo/pg-scheduler#readme
+- **Issues**: https://github.com/miguelrebelo/pg-scheduler/issues

@@ -1,0 +1,16 @@
+include README.md
+include LICENSE
+include requirements.txt
+recursive-include pg_scheduler *.py
+recursive-exclude * __pycache__
+recursive-exclude * *.py[co]
+exclude *.py
+exclude docker-compose*.yaml
+exclude Dockerfile
+exclude race_condition_test.sh
+exclude *_test.py
+exclude *_demo.py
+exclude *_example.py
+exclude test_*.py
+exclude db_monitor.py
+exclude periodic_test_multi_replica.py

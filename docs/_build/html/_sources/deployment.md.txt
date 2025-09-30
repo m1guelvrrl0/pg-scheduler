@@ -1,0 +1,492 @@
+# Production Deployment
+
+This guide covers deploying PG Scheduler in production environments.
+
+## Docker Deployment
+
+### Basic Dockerfile
+
+```dockerfile
+FROM python:3.11-slim
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application
+COPY . .
+
+# Run scheduler
+CMD ["python", "app.py"]
+```
+
+### Docker Compose
+
+```yaml
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: scheduler
+      POSTGRES_PASSWORD: scheduler123
+      POSTGRES_DB: scheduler_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scheduler -d scheduler_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  scheduler:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://scheduler:scheduler123@postgres:5432/scheduler_db
+      - MAX_CONCURRENT_JOBS=25
+      - MISFIRE_GRACE_TIME=300
+      - VACUUM_ENABLED=true
+    restart: unless-stopped
+    deploy:
+      replicas: 3  # Multiple replicas for high availability
+
+volumes:
+  postgres_data:
+```
+
+## Kubernetes Deployment
+
+### Deployment YAML
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg-scheduler
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: pg-scheduler
+  template:
+    metadata:
+      labels:
+        app: pg-scheduler
+    spec:
+      containers:
+      - name: scheduler
+        image: your-registry/pg-scheduler:latest
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: scheduler-secrets
+              key: database-url
+        - name: MAX_CONCURRENT_JOBS
+          value: "25"
+        - name: MISFIRE_GRACE_TIME
+          value: "300"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+```
+
+## Environment Configuration
+
+### Environment Variables
+
+```bash
+# Database connection
+DATABASE_URL=postgresql://user:pass@host:port/database
+
+# Scheduler configuration
+MAX_CONCURRENT_JOBS=25
+MISFIRE_GRACE_TIME=300
+VACUUM_ENABLED=true
+VACUUM_INTERVAL_MINUTES=60
+
+# Logging
+LOG_LEVEL=INFO
+LOG_FORMAT=json
+
+# Monitoring
+METRICS_ENABLED=true
+METRICS_PORT=9090
+```
+
+### Configuration Class
+
+```python
+import os
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class Config:
+    database_url: str
+    max_concurrent_jobs: int = 25
+    misfire_grace_time: int = 300
+    vacuum_enabled: bool = True
+    vacuum_interval_minutes: int = 60
+    log_level: str = "INFO"
+    
+    @classmethod
+    def from_env(cls) -> 'Config':
+        return cls(
+            database_url=os.getenv('DATABASE_URL', ''),
+            max_concurrent_jobs=int(os.getenv('MAX_CONCURRENT_JOBS', '25')),
+            misfire_grace_time=int(os.getenv('MISFIRE_GRACE_TIME', '300')),
+            vacuum_enabled=os.getenv('VACUUM_ENABLED', 'true').lower() == 'true',
+            vacuum_interval_minutes=int(os.getenv('VACUUM_INTERVAL_MINUTES', '60')),
+            log_level=os.getenv('LOG_LEVEL', 'INFO'),
+        )
+
+# Usage
+config = Config.from_env()
+```
+
+## High Availability Setup
+
+### Multiple Replicas
+
+```python
+import asyncio
+import asyncpg
+from pg_scheduler import Scheduler, VacuumConfig, VacuumPolicy
+
+async def create_ha_scheduler():
+    """Create a high-availability scheduler configuration"""
+    
+    # Connection pool with failover
+    db_pool = await asyncpg.create_pool(
+        dsn=config.database_url,
+        min_size=5,
+        max_size=20,
+        command_timeout=60,
+        server_settings={
+            'application_name': f'pg-scheduler-{os.getenv("HOSTNAME", "unknown")}'
+        }
+    )
+    
+    # Production vacuum configuration
+    vacuum_config = VacuumConfig(
+        completed=VacuumPolicy.after_days(1),
+        failed=VacuumPolicy.after_days(7),
+        cancelled=VacuumPolicy.after_days(3),
+        interval_minutes=60,
+        track_metrics=True
+    )
+    
+    # High-availability scheduler
+    scheduler = Scheduler(
+        db_pool=db_pool,
+        max_concurrent_jobs=config.max_concurrent_jobs,
+        misfire_grace_time=config.misfire_grace_time,
+        vacuum_config=vacuum_config,
+        vacuum_enabled=config.vacuum_enabled
+    )
+    
+    return scheduler
+```
+
+### Load Balancer Configuration
+
+```nginx
+upstream scheduler_backends {
+    server scheduler-1:8080;
+    server scheduler-2:8080;
+    server scheduler-3:8080;
+    
+    # Health checks
+    keepalive 32;
+}
+
+server {
+    listen 80;
+    server_name scheduler.example.com;
+    
+    location / {
+        proxy_pass http://scheduler_backends;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        
+        # Health check endpoint
+        proxy_next_upstream error timeout http_502 http_503 http_504;
+    }
+    
+    location /health {
+        proxy_pass http://scheduler_backends/health;
+        access_log off;
+    }
+}
+```
+
+## Monitoring and Observability
+
+### Health Checks
+
+```python
+from fastapi import FastAPI
+from pg_scheduler import Scheduler
+
+app = FastAPI()
+
+@app.get("/health")
+async def health_check():
+    """Basic health check"""
+    if scheduler and scheduler.is_running:
+        return {"status": "healthy"}
+    return {"status": "unhealthy"}, 503
+
+@app.get("/ready")
+async def readiness_check():
+    """Readiness check for Kubernetes"""
+    try:
+        # Check database connectivity
+        async with scheduler.db_pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        
+        return {"status": "ready"}
+    except Exception as e:
+        return {"status": "not ready", "error": str(e)}, 503
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus-style metrics"""
+    jobs = scheduler.get_periodic_jobs()
+    active_jobs = len(scheduler.active_jobs)
+    
+    return {
+        "pg_scheduler_periodic_jobs_total": len(jobs),
+        "pg_scheduler_active_jobs": active_jobs,
+        "pg_scheduler_worker_id": scheduler.worker_id,
+    }
+```
+
+### Logging Configuration
+
+```python
+import logging
+import json
+import sys
+from datetime import datetime
+
+class JSONFormatter(logging.Formatter):
+    def format(self, record):
+        log_entry = {
+            'timestamp': datetime.utcnow().isoformat(),
+            'level': record.levelname,
+            'logger': record.name,
+            'message': record.getMessage(),
+            'worker_id': getattr(record, 'worker_id', None),
+            'job_id': getattr(record, 'job_id', None),
+        }
+        
+        if record.exc_info:
+            log_entry['exception'] = self.formatException(record.exc_info)
+        
+        return json.dumps(log_entry)
+
+# Configure logging
+def setup_logging(level: str = "INFO"):
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(JSONFormatter())
+    
+    logging.basicConfig(
+        level=getattr(logging, level.upper()),
+        handlers=[handler],
+        format='%(message)s'
+    )
+```
+
+## Database Optimization
+
+### PostgreSQL Configuration
+
+```sql
+-- Optimize for job scheduler workload
+ALTER SYSTEM SET shared_buffers = '256MB';
+ALTER SYSTEM SET effective_cache_size = '1GB';
+ALTER SYSTEM SET maintenance_work_mem = '64MB';
+ALTER SYSTEM SET checkpoint_completion_target = 0.9;
+ALTER SYSTEM SET wal_buffers = '16MB';
+ALTER SYSTEM SET default_statistics_target = 100;
+
+-- Restart PostgreSQL to apply changes
+SELECT pg_reload_conf();
+```
+
+### Index Optimization
+
+```sql
+-- Additional indexes for better performance
+CREATE INDEX CONCURRENTLY idx_scheduled_jobs_status_priority_time 
+ON scheduled_jobs(status, priority, execution_time) 
+WHERE status IN ('pending', 'running');
+
+CREATE INDEX CONCURRENTLY idx_scheduled_jobs_worker_status 
+ON scheduled_jobs(worker_id, status, last_heartbeat) 
+WHERE worker_id IS NOT NULL;
+
+-- Partial indexes for common queries
+CREATE INDEX CONCURRENTLY idx_scheduled_jobs_periodic 
+ON scheduled_jobs(job_name, execution_time) 
+WHERE job_id LIKE 'periodic:%';
+```
+
+### Connection Pooling
+
+```python
+import asyncpg
+from asyncpg.pool import Pool
+
+async def create_optimized_pool() -> Pool:
+    """Create an optimized connection pool"""
+    return await asyncpg.create_pool(
+        dsn=config.database_url,
+        
+        # Pool sizing
+        min_size=5,          # Minimum connections
+        max_size=20,         # Maximum connections
+        max_queries=50000,   # Queries per connection before recycling
+        max_inactive_connection_lifetime=300,  # 5 minutes
+        
+        # Timeouts
+        command_timeout=60,  # Query timeout
+        server_settings={
+            'application_name': 'pg-scheduler',
+            'search_path': 'public',
+        },
+        
+        # Connection initialization
+        init=init_connection,
+    )
+
+async def init_connection(conn):
+    """Initialize each connection"""
+    await conn.set_type_codec(
+        'jsonb',
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema='pg_catalog'
+    )
+```
+
+## Security Considerations
+
+### Database Security
+
+```sql
+-- Create dedicated scheduler user with minimal privileges
+CREATE USER scheduler_app WITH PASSWORD 'strong_password';
+
+-- Grant only necessary permissions
+GRANT CONNECT ON DATABASE scheduler_db TO scheduler_app;
+GRANT USAGE ON SCHEMA public TO scheduler_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON scheduled_jobs TO scheduler_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON vacuum_stats TO scheduler_app;
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO scheduler_app;
+
+-- Row-level security (optional)
+ALTER TABLE scheduled_jobs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY scheduler_policy ON scheduled_jobs 
+    FOR ALL TO scheduler_app 
+    USING (true);
+```
+
+### Application Security
+
+```python
+import secrets
+from cryptography.fernet import Fernet
+
+# Encrypt sensitive job data
+def encrypt_job_data(data: dict, key: bytes) -> str:
+    """Encrypt job data before storing"""
+    f = Fernet(key)
+    json_data = json.dumps(data).encode()
+    return f.encrypt(json_data).decode()
+
+def decrypt_job_data(encrypted_data: str, key: bytes) -> dict:
+    """Decrypt job data after retrieval"""
+    f = Fernet(key)
+    decrypted_data = f.decrypt(encrypted_data.encode())
+    return json.loads(decrypted_data.decode())
+
+# Generate encryption key
+ENCRYPTION_KEY = os.getenv('ENCRYPTION_KEY') or Fernet.generate_key()
+```
+
+## Performance Tuning
+
+### Scheduler Configuration
+
+```python
+# Production-optimized configuration
+scheduler = Scheduler(
+    db_pool=db_pool,
+    max_concurrent_jobs=50,      # Tune based on your workload
+    misfire_grace_time=300,      # 5 minutes grace period
+    vacuum_config=VacuumConfig(
+        completed=VacuumPolicy.after_days(1),
+        failed=VacuumPolicy.after_days(7),
+        cancelled=VacuumPolicy.after_days(3),
+        interval_minutes=30,     # More frequent vacuum in production
+        track_metrics=True
+    )
+)
+```
+
+### Monitoring Queries
+
+```sql
+-- Monitor job queue depth
+SELECT status, COUNT(*) 
+FROM scheduled_jobs 
+GROUP BY status;
+
+-- Check for long-running jobs
+SELECT job_id, job_name, 
+       NOW() - last_heartbeat as running_time,
+       worker_id
+FROM scheduled_jobs 
+WHERE status = 'running' 
+  AND last_heartbeat < NOW() - INTERVAL '10 minutes';
+
+-- Vacuum effectiveness
+SELECT stat_date, 
+       deleted_completed + deleted_failed + deleted_cancelled as total_deleted
+FROM vacuum_stats 
+ORDER BY stat_date DESC 
+LIMIT 7;
+```
