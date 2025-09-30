@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
 from fastapi import FastAPI
-from scheduler import Scheduler
+from pg_scheduler import Scheduler
 import asyncpg
 import asyncio
 import logging

@@ -5,7 +5,7 @@ Example usage of PG Scheduler
 import asyncio
 import asyncpg
 from datetime import datetime, timedelta, UTC
-from .scheduler import Scheduler, JobPriority, periodic
+from pg_scheduler import Scheduler, JobPriority, periodic
 
 
 # Example periodic jobs

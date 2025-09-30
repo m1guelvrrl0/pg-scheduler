@@ -1,7 +1,7 @@
 import asyncio
 import asyncpg
 from datetime import datetime, timedelta, UTC
-from scheduler import Scheduler
+from pg_scheduler import Scheduler, JobPriority, periodic
 import logging
 
 logging.basicConfig(
