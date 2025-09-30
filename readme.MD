@@ -316,6 +316,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## 🔗 Links
 
 - **PyPI**: https://pypi.org/project/pg-scheduler/
-- **GitHub**: https://github.com/miguelrebelo/pg-scheduler
-- **Documentation**: https://github.com/miguelrebelo/pg-scheduler#readme
-- **Issues**: https://github.com/miguelrebelo/pg-scheduler/issues
+- **GitHub**: https://github.com/m1guelvrrl0/pg-scheduler
+- **Documentation**: https://github.com/m1guelvrrl0/pg-scheduler#readme
+- **Issues**: https://github.com/m1guelvrrl0/pg-scheduler/issues
