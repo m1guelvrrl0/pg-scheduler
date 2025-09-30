@@ -113,14 +113,14 @@ async def exclusive_maintenance():
 
 ## 🔄 Periodic Jobs Features
 
-The `@periodic` decorator provides powerful recurring job functionality:
+The `@periodic` decorator provides powerful recurring job functionality with **built-in cross-node deduplication**:
 
+- **Cross-Node Deduplication**: Automatically prevents duplicate executions across multiple nodes sharing the same database
 - **Automatic Registration**: Jobs are automatically registered when decorated
-- **Deduplication**: Uses deterministic job IDs to prevent duplicate executions across replicas
 - **Self-rescheduling**: Automatically schedules the next execution after completion
-- **Advisory Locks**: Optional PostgreSQL advisory locks for exclusive execution
 - **Priority Support**: Use `JobPriority.NORMAL` or `JobPriority.CRITICAL`
 - **Retry Logic**: Configure `max_retries` for failed executions
+- **Advisory Locks**: Optional exclusive execution (rarely needed - see note above)
 - **Management**: Enable/disable jobs dynamically
 
 ### Decorator Parameters
@@ -128,7 +128,7 @@ The `@periodic` decorator provides powerful recurring job functionality:
 ```python
 @periodic(
     every=timedelta(minutes=15),        # Required: execution interval
-    use_advisory_lock=False,            # Optional: use advisory locks instead of dedup
+    use_advisory_lock=False,            # Optional: exclusive execution (default dedup is usually sufficient)
     priority=JobPriority.NORMAL,        # Optional: job priority
     max_retries=0,                      # Optional: retry attempts on failure
     job_name=None,                      # Optional: custom job name (auto-generated)
@@ -136,6 +136,25 @@ The `@periodic` decorator provides powerful recurring job functionality:
     enabled=True                        # Optional: whether job is enabled
 )
 ```
+
+### Cross-Node Deduplication
+
+The `@periodic` decorator automatically prevents duplicate executions across multiple nodes:
+
+```python
+# Multiple nodes running the same code
+@periodic(every=timedelta(minutes=5))
+async def cleanup_task():
+    print("Running cleanup...")
+
+# What happens:
+# - Node 1: Schedules job for 10:05 → ✅ Success
+# - Node 2: Tries to schedule same job → ❌ "Already exists, ignoring"  
+# - Node 3: Tries to schedule same job → ❌ "Already exists, ignoring"
+# - Result: Only Node 1 executes the cleanup at 10:05
+```
+
+**No configuration needed** - this works automatically for any nodes sharing the same PostgreSQL database.
 
 ### Management API
 
