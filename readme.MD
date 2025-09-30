@@ -12,6 +12,8 @@ It makes minimal assumptions about how you run it other than that you are in an 
 
 This library is focused on easy to use and deploy scheduler and not being an all comprehensive job runner so if you need something more advanced and complicated like workers queues and worker producer patterns I believe these are already very well covered in the python ecosystem and I would suggest you to look at those instead.
 
+![PostgreSQL for Everything](docs/images/postgres-meme.webp)
+
 ## ⚠️ Project Status
 
 This project is currently in **early development** (v0.1.0). While functional, please note:

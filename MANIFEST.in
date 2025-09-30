@@ -1,6 +1,7 @@
 include README.md
 include LICENSE
 include requirements.txt
+recursive-include docs *.png *.jpg *.gif *.webp
 recursive-include pg_scheduler *.py
 recursive-exclude * __pycache__
 recursive-exclude * *.py[co]
