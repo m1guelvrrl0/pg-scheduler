@@ -102,7 +102,7 @@ class PeriodicJobConfig:
     """Configuration for a periodic job"""
     func: Callable
     interval: timedelta
-    use_advisory_lock: bool = False
+    use_advisory_lock: bool = False # Unadvisable unless you need Master node pattern where only a specific instance can run this for whatever reason.
     priority: 'JobPriority' = None  # Will default to JobPriority.NORMAL
     max_retries: int = 0
     job_name: Optional[str] = None  # Auto-generated from function name if None

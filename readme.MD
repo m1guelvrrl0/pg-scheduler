@@ -103,11 +103,13 @@ async def generate_hourly_report():
 # Advisory locks for exclusive execution
 @periodic(every=timedelta(minutes=30), use_advisory_lock=True)
 async def exclusive_maintenance():
-    """Maintenance that should only run on one worker at a time"""
+    """Exclusive operation - only one instance across entire cluster"""
     print("🔒 Running exclusive maintenance...")
     # Your maintenance logic here
     print("✅ Maintenance completed")
 ```
+
+**Note**: Most jobs don't need `use_advisory_lock=True`. Use it only when you need absolute exclusivity across all workers (e.g., database migrations, leader coordination).
 
 ## 🔄 Periodic Jobs Features
 
