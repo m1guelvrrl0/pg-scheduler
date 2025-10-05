@@ -16,6 +16,8 @@ import hashlib
 import functools
 import struct
 
+from .job_priority import JobPriority
+
 # Sentinel value to distinguish "not specified" from "explicitly None"
 _UNSET = object()
 
@@ -24,34 +26,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-class JobPriority(Enum):
-    """User-friendly job priority levels (lower number = higher priority)"""
-    CRITICAL = "critical"  # Highest priority (value: 1)
-    HIGH = "high"          # High priority (value: 3)
-    NORMAL = "normal"      # Default priority (value: 5)
-    LOW = "low"            # Low priority (value: 8)
-    
-    @property
-    def db_value(self) -> int:
-        """Convert enum to database integer value (lower = higher priority)"""
-        return {
-            "critical": 1,
-            "high": 3,
-            "normal": 5,
-            "low": 8
-        }[self.value]
-    
-    @classmethod
-    def from_db_value(cls, db_value: int) -> 'JobPriority':
-        """Convert database integer back to enum"""
-        mapping = {
-            1: cls.CRITICAL,
-            3: cls.HIGH,
-            5: cls.NORMAL,
-            8: cls.LOW
-        }
-        return mapping.get(db_value, cls.NORMAL)
 
 class ConflictResolution(Enum):
     """Strategies for handling duplicate job_id conflicts"""

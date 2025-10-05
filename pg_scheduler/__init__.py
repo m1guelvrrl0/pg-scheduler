@@ -11,9 +11,9 @@ This library provides a robust job scheduling system built on PostgreSQL with fe
 - Graceful shutdown and error handling
 """
 
+from .job_priority import JobPriority
 from .scheduler import (
     Scheduler,
-    JobPriority,
     ConflictResolution,
     VacuumPolicy,
     VacuumConfig,
