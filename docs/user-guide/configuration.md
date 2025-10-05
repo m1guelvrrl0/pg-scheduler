@@ -220,23 +220,48 @@ FROM scheduled_jobs;
 
 ### Priority
 
+PG Scheduler supports four priority levels (lower number = higher priority):
+
 ```python
 from pg_scheduler import JobPriority
 
-# Normal priority (default)
-await scheduler.schedule(
-    my_function,
-    execution_time=run_time,
-    priority=JobPriority.NORMAL
-)
-
-# Critical priority (runs first)
+# Critical priority (highest - runs first)
 await scheduler.schedule(
     urgent_function,
     execution_time=run_time,
-    priority=JobPriority.CRITICAL
+    priority=JobPriority.CRITICAL  # Priority: 1
+)
+
+# High priority
+await scheduler.schedule(
+    important_function,
+    execution_time=run_time,
+    priority=JobPriority.HIGH  # Priority: 3
+)
+
+# Normal priority (default)
+await scheduler.schedule(
+    regular_function,
+    execution_time=run_time,
+    priority=JobPriority.NORMAL  # Priority: 5
+)
+
+# Low priority (lowest - runs last)
+await scheduler.schedule(
+    cleanup_function,
+    execution_time=run_time,
+    priority=JobPriority.LOW  # Priority: 8
 )
 ```
+
+**Priority Ordering:**
+Jobs are executed in ascending priority order:
+1. `CRITICAL` (1) → Executes first
+2. `HIGH` (3)
+3. `NORMAL` (5) - Default
+4. `LOW` (8) → Executes last
+
+Within the same priority level, jobs are executed in order of their `execution_time`.
 
 ### Retry Logic
 

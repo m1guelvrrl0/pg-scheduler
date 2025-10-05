@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **New priority levels**: Added `JobPriority.HIGH` and `JobPriority.LOW` for finer-grained priority control
+  - `CRITICAL` (1) - Highest priority
+  - `HIGH` (3) - High priority (new!)
+  - `NORMAL` (5) - Default priority
+  - `LOW` (8) - Low priority (new!)
 - **Per-job misfire grace time configuration**: Jobs can now override the scheduler's default grace time via the `misfire_grace_time` parameter in `schedule()`
 - Support for `misfire_grace_time=None` to disable job expiration entirely (APScheduler-like behavior)
 - Sentinel pattern (`_UNSET`) to distinguish between "parameter not specified" and "explicitly set to None"
