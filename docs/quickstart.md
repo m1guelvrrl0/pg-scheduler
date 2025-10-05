@@ -158,6 +158,32 @@ async def database_maintenance():
     pass
 ```
 
+### Misfire Grace Time
+
+Control when late jobs expire instead of running:
+
+```python
+# Global default: 5 minute grace period
+scheduler = Scheduler(db_pool, misfire_grace_time=300)
+
+# Per-job override: 60 second grace period
+await scheduler.schedule(
+    my_function,
+    execution_time=datetime.now(UTC) + timedelta(minutes=5),
+    misfire_grace_time=60  # Expires 60s after execution_time
+)
+
+# No expiration: job runs whenever possible
+await scheduler.schedule(
+    my_function,
+    execution_time=datetime.now(UTC) + timedelta(minutes=5),
+    misfire_grace_time=None  # Never expires
+)
+
+# No global expiration
+scheduler = Scheduler(db_pool, misfire_grace_time=None)  # No jobs expire by default
+```
+
 ### Manual Job Management
 
 ```python

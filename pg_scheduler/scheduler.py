@@ -7,7 +7,7 @@ import signal
 import sys
 import inspect
 from datetime import UTC, timedelta
-from typing import Optional, Set, Dict, Callable, Any
+from typing import Optional, Set, Dict, Callable, Any, Union
 from enum import Enum
 from dataclasses import dataclass
 import uuid
@@ -15,6 +15,9 @@ import random
 import hashlib
 import functools
 import struct
+
+# Sentinel value to distinguish "not specified" from "explicitly None"
+_UNSET = object()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -344,7 +347,7 @@ class Scheduler:
     def __init__(self, 
                  db_pool: asyncpg.Pool, 
                  max_concurrent_jobs: int = 25, 
-                 misfire_grace_time: int = 300,  # 5 minutes default
+                 misfire_grace_time: Optional[int] = 300,  # 5 minutes default, None = no expiration
                  vacuum_config: Optional[VacuumConfig] = None,
                  vacuum_enabled: bool = True):
         """
@@ -353,7 +356,8 @@ class Scheduler:
         Args:
             db_pool: Connection to the PostgreSQL database.
             max_concurrent_jobs: Maximum number of jobs to run concurrently
-            misfire_grace_time: Seconds after execution_time before jobs expire (like APScheduler)
+            misfire_grace_time: Default seconds after execution_time before jobs expire.
+                              Set to None for no expiration. Can be overridden per-job.
             vacuum_config: Configuration for job cleanup policies (uses defaults if None)
             vacuum_enabled: Whether to enable automatic vacuum cleanup
         """
@@ -534,8 +538,23 @@ class Scheduler:
                 retry_count INTEGER DEFAULT 0,
                 max_retries INTEGER DEFAULT 0,
                 worker_id TEXT,  -- Track which worker is processing
-                error_message TEXT -- Track last error for debugging
+                error_message TEXT, -- Track last error for debugging
+                misfire_grace_time INTEGER  -- Per-job misfire grace time in seconds, NULL = no expiration
             );
+        """)
+        
+        # Add misfire_grace_time column if it doesn't exist (migration for existing tables)
+        await self._execute_with_retry("""
+            DO $$ 
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name = 'scheduled_jobs' 
+                    AND column_name = 'misfire_grace_time'
+                ) THEN
+                    ALTER TABLE scheduled_jobs ADD COLUMN misfire_grace_time INTEGER;
+                END IF;
+            END $$;
         """)
         
         # Create indexes for reliability and performance
@@ -657,7 +676,8 @@ class Scheduler:
         priority: JobPriority = JobPriority.NORMAL,
         max_retries: int = 0,
         job_id: Optional[str] = None,
-        conflict_resolution: ConflictResolution = ConflictResolution.RAISE
+        conflict_resolution: ConflictResolution = ConflictResolution.RAISE,
+        misfire_grace_time: Union[int, None, object] = _UNSET
     ) -> str:
         """
         Schedule an async I/O function to run at a specific time.
@@ -671,6 +691,10 @@ class Scheduler:
             max_retries: Maximum retry attempts for failed jobs
             job_id: Optional custom job ID (auto-generated if not provided)
             conflict_resolution: How to handle duplicate job_id (RAISE, IGNORE, REPLACE)
+            misfire_grace_time: Seconds after execution_time before job expires.
+                              - Not specified (default): uses scheduler's misfire_grace_time
+                              - Explicit integer (e.g., 60): job expires after N seconds
+                              - Explicit None: job never expires
             
         Returns:
             str: The job ID of the scheduled job
@@ -687,6 +711,15 @@ class Scheduler:
             'kwargs': kwargs or {}
         }
         
+        # Determine effective misfire_grace_time
+        # _UNSET = use scheduler default
+        # None = explicit no expiration
+        # int = explicit per-job grace time
+        if misfire_grace_time is _UNSET:
+            effective_misfire_grace_time = self.misfire_grace_time
+        else:
+            effective_misfire_grace_time = misfire_grace_time
+        
         # Schedule the job in the database
         scheduled_job_id = await self.schedule_job(
             func.__name__, 
@@ -695,7 +728,8 @@ class Scheduler:
             priority=priority,
             max_retries=max_retries,
             job_id=job_id,
-            conflict_resolution=conflict_resolution
+            conflict_resolution=conflict_resolution,
+            misfire_grace_time=effective_misfire_grace_time
         )
         
         logger.info(f"Scheduled async function {func.__name__} to run at {execution_time} (priority={priority.value}, job_id={scheduled_job_id})")
@@ -752,21 +786,24 @@ class Scheduler:
             # Use a transaction for atomic job claiming
             async with self.db_pool.acquire() as conn:
                 async with conn.transaction():
-                    # Calculate expiration cutoff for misfire grace time
+                    # Expire old jobs that are past their misfire grace time
+                    # Per-job misfire_grace_time takes precedence over scheduler default
+                    # NULL misfire_grace_time = no expiration
                     current_time = datetime.datetime.now(UTC)
-                    expiration_cutoff = current_time - datetime.timedelta(seconds=self.misfire_grace_time)
                     
-                    # Expire old jobs that are past the misfire grace time
-                    expired_jobs = await conn.fetch("""
-                        UPDATE scheduled_jobs 
-                        SET status = 'expired', worker_id = $1
-                        WHERE status = 'pending' 
-                        AND execution_time < $2
-                        RETURNING job_id, job_name, execution_time;
-                    """, self.worker_id, expiration_cutoff)
-                    
-                    if expired_jobs:
-                        logger.warning(f"Expired {len(expired_jobs)} jobs past grace time")
+                    if self.misfire_grace_time is not None:
+                        # Only check for expired jobs if scheduler has a default grace time
+                        expired_jobs = await conn.fetch("""
+                            UPDATE scheduled_jobs 
+                            SET status = 'expired', worker_id = $1
+                            WHERE status = 'pending' 
+                            AND misfire_grace_time IS NOT NULL  -- Only expire jobs with explicit misfire_grace_time
+                            AND execution_time + INTERVAL '1 second' * misfire_grace_time < $2
+                            RETURNING job_id, job_name, execution_time, misfire_grace_time;
+                        """, self.worker_id, current_time)
+                        
+                        if expired_jobs:
+                            logger.warning(f"Expired {len(expired_jobs)} jobs past grace time")
                     
                     # Claim ready jobs atomically using CTE pattern (limited by available semaphore slots)
                     ready_jobs = await conn.fetch("""
@@ -1122,7 +1159,7 @@ class Scheduler:
         except Exception as e:
             logger.error(f"Failed to record vacuum metrics: {e}")
 
-    async def schedule_job(self, job_name, execution_time, task_data, priority: JobPriority = JobPriority.NORMAL, max_retries: int = 0, job_id: Optional[str] = None, conflict_resolution: ConflictResolution = ConflictResolution.RAISE) -> str:
+    async def schedule_job(self, job_name, execution_time, task_data, priority: JobPriority = JobPriority.NORMAL, max_retries: int = 0, job_id: Optional[str] = None, conflict_resolution: ConflictResolution = ConflictResolution.RAISE, misfire_grace_time: Optional[int] = None) -> str:
         """
         Schedule a job by inserting it into the 'scheduled_jobs' table.
         
@@ -1134,7 +1171,9 @@ class Scheduler:
             max_retries: Maximum retry attempts for failed jobs
             job_id: Optional custom job ID (auto-generated if not provided)
             conflict_resolution: How to handle duplicate job_id (RAISE, IGNORE, REPLACE)
-            
+            misfire_grace_time: Per-job misfire grace time in seconds. 
+                              None = use scheduler default
+                              
         Returns:
             str: The job ID of the scheduled job
             
@@ -1142,6 +1181,9 @@ class Scheduler:
             ValueError: If the provided job_id already exists and conflict_resolution is RAISE
         """
         json_task_data = json.dumps(task_data)
+        
+        # misfire_grace_time is already resolved by schedule() method
+        # It can be None (no expiration) or int (grace time in seconds)
         
         if job_id is not None:
             # Check if job_id already exists first
@@ -1170,6 +1212,7 @@ class Scheduler:
                                 task_data = $4::jsonb,
                                 priority = $5,
                                 max_retries = $6,
+                                misfire_grace_time = $7,
                                 status = CASE 
                                     WHEN status IN ('completed', 'failed', 'cancelled', 'expired') THEN 'pending'
                                     ELSE status
@@ -1181,17 +1224,17 @@ class Scheduler:
                                 lease_until = NULL
                             WHERE job_id = $1
                             RETURNING job_id;
-                        """, job_id, job_name, execution_time, json_task_data, priority.db_value, max_retries)
+                        """, job_id, job_name, execution_time, json_task_data, priority.db_value, max_retries, misfire_grace_time)
                         
                         logger.info(f"Job ID '{job_id}' replaced with new parameters (conflict_resolution=REPLACE)")
                         return result[0]['job_id']
                 
                 # Insert with custom job_id (now we know it's unique)
                 result = await self._execute_with_retry("""
-                    INSERT INTO scheduled_jobs (job_id, job_name, execution_time, status, task_data, priority, max_retries)
-                    VALUES ($1, $2, $3, 'pending', $4::jsonb, $5, $6)
+                    INSERT INTO scheduled_jobs (job_id, job_name, execution_time, status, task_data, priority, max_retries, misfire_grace_time)
+                    VALUES ($1, $2, $3, 'pending', $4::jsonb, $5, $6, $7)
                     RETURNING job_id;
-                """, job_id, job_name, execution_time, json_task_data, priority.db_value, max_retries)
+                """, job_id, job_name, execution_time, json_task_data, priority.db_value, max_retries, misfire_grace_time)
                 
             except ValueError:
                 # Re-raise our custom error
@@ -1207,17 +1250,17 @@ class Scheduler:
                     else:
                         # For IGNORE or REPLACE, try again (recursively call with same parameters)
                         logger.warning(f"Race condition detected for job_id '{job_id}', retrying with conflict_resolution={conflict_resolution.value}")
-                        return await self.schedule_job(job_name, execution_time, task_data, priority, max_retries, job_id, conflict_resolution)
+                        return await self.schedule_job(job_name, execution_time, task_data, priority, max_retries, job_id, conflict_resolution, misfire_grace_time)
                 else:
                     # Re-raise unexpected errors
                     raise
         else:
             # Let database auto-generate job_id
             result = await self._execute_with_retry("""
-                INSERT INTO scheduled_jobs (job_name, execution_time, status, task_data, priority, max_retries)
-                VALUES ($1, $2, 'pending', $3::jsonb, $4, $5)
+                INSERT INTO scheduled_jobs (job_name, execution_time, status, task_data, priority, max_retries, misfire_grace_time)
+                VALUES ($1, $2, 'pending', $3::jsonb, $4, $5, $6)
                 RETURNING job_id;
-            """, job_name, execution_time, json_task_data, priority.db_value, max_retries)
+            """, job_name, execution_time, json_task_data, priority.db_value, max_retries, misfire_grace_time)
         
         scheduled_job_id = result[0]['job_id']
         logger.info(f"Job scheduled: {job_name} at {execution_time} (priority={priority.value}, job_id={scheduled_job_id})")
