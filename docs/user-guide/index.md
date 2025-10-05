@@ -1,6 +1,6 @@
 # User Guide
-
-This comprehensive guide covers all aspects of using PG Scheduler.
+IN-PROGRESS
+This comprehensive guide plans to cover all aspects of using PG Scheduler.
 
 ```{toctree}
 :maxdepth: 2
