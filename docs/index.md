@@ -1,6 +1,6 @@
 # PG Scheduler Documentation
 
-Welcome to PG Scheduler - a robust, production-ready job scheduler built on PostgreSQL with async I/O support.
+Welcome to PG Scheduler - a robust job scheduler built on PostgreSQL with async I/O support.
 
 ```{toctree}
 :maxdepth: 2
@@ -115,7 +115,7 @@ Built-in reliability features include:
 - **Graceful shutdown** - Wait for jobs to complete
 - **Retry logic** - Automatic retry with exponential backoff
 
-### Production Ready
+### Project Overview Features
 
 - **PostgreSQL backend** - Reliable, ACID-compliant storage
 - **Async/await support** - Built for modern Python
