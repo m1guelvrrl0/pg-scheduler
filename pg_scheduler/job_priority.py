@@ -29,29 +29,6 @@ class JobPriority(Enum):
     
     Lower priority numbers indicate higher priority (jobs execute first).
     Jobs are processed in ascending priority order: 1 → 3 → 5 → 8.
-    
-    Attributes:
-        CRITICAL: Highest priority (value: 1) - executes first
-        HIGH: High priority (value: 3) - important tasks
-        NORMAL: Default priority (value: 5) - regular tasks
-        LOW: Low priority (value: 8) - background tasks, executes last
-        
-    Example:
-        >>> from pg_scheduler import JobPriority, Scheduler
-        >>> 
-        >>> # Schedule a critical job
-        >>> await scheduler.schedule(
-        ...     urgent_function,
-        ...     execution_time=datetime.now(UTC) + timedelta(minutes=5),
-        ...     priority=JobPriority.CRITICAL
-        ... )
-        >>> 
-        >>> # Schedule a low priority cleanup job
-        >>> await scheduler.schedule(
-        ...     cleanup_function,
-        ...     execution_time=datetime.now(UTC) + timedelta(hours=1),
-        ...     priority=JobPriority.LOW
-        ... )
     """
     
     CRITICAL = "critical"  # Highest priority (value: 1)
@@ -85,14 +62,6 @@ class JobPriority(Enum):
             
         Note:
             If an unknown value is provided, defaults to NORMAL.
-            
-        Example:
-            >>> priority = JobPriority.from_db_value(1)
-            >>> assert priority == JobPriority.CRITICAL
-            >>> 
-            >>> # Unknown values default to NORMAL
-            >>> priority = JobPriority.from_db_value(99)
-            >>> assert priority == JobPriority.NORMAL
         """
         member_name = _DB_TO_PRIORITY.get(db_value, "NORMAL")
         return cls[member_name]

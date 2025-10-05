@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `HIGH` (3) - High priority (new!)
   - `NORMAL` (5) - Default priority
   - `LOW` (8) - Low priority (new!)
+
 - **Per-job misfire grace time configuration**: Jobs can now override the scheduler's default grace time via the `misfire_grace_time` parameter in `schedule()`
 - Support for `misfire_grace_time=None` to disable job expiration entirely (APScheduler-like behavior)
 - Sentinel pattern (`_UNSET`) to distinguish between "parameter not specified" and "explicitly set to None"
@@ -21,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation explaining misfire grace time behavior and examples
 
 ### Changed
+- **Code organization improvements**: Refactored `JobPriority` and periodic job functionality into separate modules
+  - `JobPriority` moved to `pg_scheduler/job_priority.py` with optimized static dictionary lookups
+  - Periodic job functionality moved to `pg_scheduler/periodic.py` for better maintainability
+  - No breaking changes - all imports remain backward compatible
 - `Scheduler.__init__` now accepts `Optional[int]` for `misfire_grace_time` parameter (default: 300 seconds)
   - `None` = no jobs expire (global setting)
   - Integer = default grace period in seconds
