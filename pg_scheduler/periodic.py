@@ -20,7 +20,8 @@ from typing import Callable, Dict, Optional, TYPE_CHECKING
 from .job_priority import JobPriority
 
 if TYPE_CHECKING:
-    from .scheduler import Scheduler, ConflictResolution
+    from .scheduler import Scheduler
+    from .conflict_resolution import ConflictResolution
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +83,7 @@ class PeriodicJobRegistry:
     async def _start_periodic_job(self, config: PeriodicJobConfig):
         """Start a single periodic job"""
         # Import here to avoid circular import
-        from .scheduler import ConflictResolution
+        from .conflict_resolution import ConflictResolution
         
         # Calculate next execution time
         next_run = datetime.datetime.now(UTC) + config.interval
@@ -186,7 +187,7 @@ class PeriodicJobRegistry:
     async def _reschedule_periodic_job(self, config: PeriodicJobConfig):
         """Reschedule the periodic job for the next execution"""
         # Import here to avoid circular import
-        from .scheduler import ConflictResolution
+        from .conflict_resolution import ConflictResolution
         
         try:
             next_run = datetime.datetime.now(UTC) + config.interval

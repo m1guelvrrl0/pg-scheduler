@@ -8,13 +8,13 @@ import sys
 import inspect
 from datetime import UTC, timedelta
 from typing import Optional, Set, Dict, Any, Union
-from enum import Enum
-from dataclasses import dataclass
 import uuid
 import random
 
+from .conflict_resolution import ConflictResolution
 from .job_priority import JobPriority
 from .periodic import _periodic_registry, PeriodicJobConfig
+from .vacuum import VacuumConfig, VacuumPolicy, VacuumTrigger
 
 # Sentinel value to distinguish "not specified" from "explicitly None"
 _UNSET = object()
@@ -24,64 +24,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-class ConflictResolution(Enum):
-    """Strategies for handling duplicate job_id conflicts"""
-    RAISE = "raise"        # Raise ValueError (default, safest)
-    IGNORE = "ignore"      # Ignore the new job, return existing job_id  
-    REPLACE = "replace"    # Replace/update the existing job with new parameters
-
-class VacuumTrigger(Enum):
-    """Vacuum policy trigger types"""
-    IMMEDIATE = "immediate"      # Delete immediately on status change
-    TIME_BASED = "time_based"    # Delete after X time
-    COUNT_BASED = "count_based"  # Keep only last N jobs
-    NEVER = "never"              # No automatic cleanup
-
-@dataclass
-class VacuumPolicy:
-    """Configuration for a vacuum policy"""
-    trigger: VacuumTrigger
-    days: Optional[int] = None           # For TIME_BASED policies
-    keep_count: Optional[int] = None     # For COUNT_BASED policies
-    
-    @classmethod
-    def immediate(cls) -> 'VacuumPolicy':
-        """Delete immediately when job reaches this status"""
-        return cls(VacuumTrigger.IMMEDIATE)
-        
-    @classmethod  
-    def after_days(cls, days: int) -> 'VacuumPolicy':
-        """Delete jobs after N days in this status"""
-        return cls(VacuumTrigger.TIME_BASED, days=days)
-        
-    @classmethod
-    def keep_last(cls, count: int) -> 'VacuumPolicy':
-        """Keep only the last N jobs per job_name in this status"""
-        return cls(VacuumTrigger.COUNT_BASED, keep_count=count)
-        
-    @classmethod
-    def never(cls) -> 'VacuumPolicy':
-        """Never automatically clean jobs in this status"""
-        return cls(VacuumTrigger.NEVER)
-
-@dataclass
-class VacuumConfig:
-    """Complete vacuum configuration for the scheduler"""
-    completed: VacuumPolicy = None       # Will default to after_days(1)
-    failed: VacuumPolicy = None          # Will default to after_days(7)  
-    cancelled: VacuumPolicy = None       # Will default to after_days(3)
-    interval_minutes: int = 60           # How often to run vacuum
-    track_metrics: bool = False          # Whether to store vacuum metrics in DB
-    
-    def __post_init__(self):
-        """Set sensible defaults for None policies"""
-        if self.completed is None:
-            self.completed = VacuumPolicy.after_days(1)
-        if self.failed is None:
-            self.failed = VacuumPolicy.after_days(7)
-        if self.cancelled is None:
-            self.cancelled = VacuumPolicy.after_days(3)
 
 
 class Scheduler:

@@ -22,9 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation explaining misfire grace time behavior and examples
 
 ### Changed
-- **Code organization improvements**: Refactored `JobPriority` and periodic job functionality into separate modules
+- **Code organization improvements**: Major refactoring for better modularity and maintainability
   - `JobPriority` moved to `pg_scheduler/job_priority.py` with optimized static dictionary lookups
-  - Periodic job functionality moved to `pg_scheduler/periodic.py` for better maintainability
+  - Periodic job functionality moved to `pg_scheduler/periodic.py`
+  - Conflict resolution strategies moved to `pg_scheduler/conflict_resolution.py`
+  - Vacuum policies and configuration moved to `pg_scheduler/vacuum.py`
+  - `scheduler.py` reduced from ~1,461 lines to ~1,163 lines (20% reduction)
   - No breaking changes - all imports remain backward compatible
 - `Scheduler.__init__` now accepts `Optional[int]` for `misfire_grace_time` parameter (default: 300 seconds)
   - `None` = no jobs expire (global setting)

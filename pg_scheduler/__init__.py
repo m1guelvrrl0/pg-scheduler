@@ -11,15 +11,11 @@ This library provides a robust job scheduling system built on PostgreSQL with fe
 - Graceful shutdown and error handling
 """
 
+from .conflict_resolution import ConflictResolution
 from .job_priority import JobPriority
 from .periodic import periodic
-from .scheduler import (
-    Scheduler,
-    ConflictResolution,
-    VacuumPolicy,
-    VacuumConfig,
-    VacuumTrigger,
-)
+from .vacuum import VacuumConfig, VacuumPolicy, VacuumTrigger
+from .scheduler import Scheduler
 
 __version__ = "0.1.0"
 __author__ = "Miguel Rebelo"
