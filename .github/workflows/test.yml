@@ -87,7 +87,7 @@ jobs:
     
     - name: Run race condition tests
       run: |
-        docker compose -f docker-compose.race-test.yml up --build --abort-on-container-exit
+        docker compose -f docker-compose.race-test.yml up --build --abort-on-container-exit --exit-code-from monitor
     
     - name: Show test results
       if: always()

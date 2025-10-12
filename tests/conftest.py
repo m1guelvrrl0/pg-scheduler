@@ -21,17 +21,9 @@ DB_PASSWORD = os.getenv("PGPASSWORD", "scheduler123")
 DB_NAME = os.getenv("PGDATABASE", "scheduler_db")
 
 
-@pytest.fixture(scope="session")
-def event_loop():
-    """Create an event loop for the test session."""
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
-
-
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="function")
 async def db_pool() -> AsyncGenerator[asyncpg.Pool, None]:
-    """Create a database connection pool for the test session."""
+    """Create a database connection pool for each test."""
     pool = await asyncpg.create_pool(
         host=DB_HOST,
         port=DB_PORT,
