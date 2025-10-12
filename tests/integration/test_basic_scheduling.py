@@ -10,87 +10,133 @@ import pytest
 from pg_scheduler import ConflictResolution, JobPriority, Scheduler
 
 
+# Module-level test result storage
+_test_results = {}
+
+
+async def simple_test_job(test_id: str):
+    """Simple test job that records execution."""
+    if test_id not in _test_results:
+        _test_results[test_id] = []
+    _test_results[test_id].append("executed")
+
+
+async def args_test_job(test_id: str, x: int, y: int):
+    """Test job with args."""
+    if test_id not in _test_results:
+        _test_results[test_id] = []
+    _test_results[test_id].append(x + y)
+
+
+async def kwargs_test_job(test_id: str, x: int = 0, y: int = 0):
+    """Test job with kwargs."""
+    if test_id not in _test_results:
+        _test_results[test_id] = []
+    _test_results[test_id].append(x * y)
+
+
+async def priority_test_job(test_id: str, priority_name: str):
+    """Test job for priority testing."""
+    if test_id not in _test_results:
+        _test_results[test_id] = []
+    _test_results[test_id].append(priority_name)
+
+
+async def failing_test_job(test_id: str, fail_count: int):
+    """Test job that fails a specified number of times."""
+    if test_id not in _test_results:
+        _test_results[test_id] = {"attempts": 0}
+    
+    _test_results[test_id]["attempts"] += 1
+    
+    if _test_results[test_id]["attempts"] <= fail_count:
+        raise ValueError(f"Intentional failure {_test_results[test_id]['attempts']}")
+
+
 @pytest.mark.integration
 class TestBasicScheduling:
     """Tests for basic job scheduling operations."""
     
-    async def test_schedule_simple_job(self, scheduler, sample_job, time_utils):
+    def setup_method(self):
+        """Clear test results before each test."""
+        _test_results.clear()
+    
+    async def test_schedule_simple_job(self, scheduler, time_utils):
         """Test scheduling a simple job."""
+        test_id = "test_schedule_simple"
         execution_time = time_utils.future(seconds=1)
         
         job_id = await scheduler.schedule(
-            sample_job,
-            execution_time=execution_time
+            simple_test_job,
+            execution_time=execution_time,
+            args=(test_id,)
         )
         
         assert job_id is not None
         assert isinstance(job_id, str)
     
-    async def test_job_execution(self, scheduler, job_counter, time_utils):
+    async def test_job_execution(self, scheduler, time_utils):
         """Test that scheduled job actually executes."""
+        test_id = "test_execution"
         execution_time = time_utils.future(seconds=1)
         
         await scheduler.schedule(
-            job_counter["job"],
-            execution_time=execution_time
+            simple_test_job,
+            execution_time=execution_time,
+            args=(test_id,)
         )
         
         # Wait for job to execute
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
         
-        assert job_counter["count"] == 1
+        assert test_id in _test_results
+        assert len(_test_results[test_id]) == 1
     
     async def test_job_with_args(self, scheduler, time_utils):
         """Test scheduling job with positional arguments."""
-        result = []
-        
-        async def job(x, y):
-            result.append(x + y)
-        
+        test_id = "test_args"
         execution_time = time_utils.future(seconds=1)
+        
         await scheduler.schedule(
-            job,
+            args_test_job,
             execution_time=execution_time,
-            args=(5, 3)
+            args=(test_id, 5, 3)
         )
         
-        await asyncio.sleep(2)
-        assert result == [8]
+        await asyncio.sleep(3)
+        assert test_id in _test_results
+        assert _test_results[test_id] == [8]
     
     async def test_job_with_kwargs(self, scheduler, time_utils):
         """Test scheduling job with keyword arguments."""
-        result = []
-        
-        async def job(x=0, y=0):
-            result.append(x * y)
-        
+        test_id = "test_kwargs"
         execution_time = time_utils.future(seconds=1)
+        
         await scheduler.schedule(
-            job,
+            kwargs_test_job,
             execution_time=execution_time,
-            kwargs={"x": 4, "y": 7}
+            kwargs={"test_id": test_id, "x": 4, "y": 7}
         )
         
-        await asyncio.sleep(2)
-        assert result == [28]
+        await asyncio.sleep(3)
+        assert test_id in _test_results
+        assert _test_results[test_id] == [28]
     
     async def test_job_with_args_and_kwargs(self, scheduler, time_utils):
         """Test scheduling job with both args and kwargs."""
-        result = []
-        
-        async def job(a, b, c=0, d=0):
-            result.append(a + b + c + d)
-        
+        test_id = "test_both"
         execution_time = time_utils.future(seconds=1)
+        
         await scheduler.schedule(
-            job,
+            args_test_job,
             execution_time=execution_time,
-            args=(1, 2),
-            kwargs={"c": 3, "d": 4}
+            args=(test_id, 5),
+            kwargs={"y": 5}
         )
         
-        await asyncio.sleep(2)
-        assert result == [10]
+        await asyncio.sleep(3)
+        assert test_id in _test_results
+        assert _test_results[test_id] == [10]
     
     async def test_multiple_jobs(self, scheduler, job_counter, time_utils):
         """Test scheduling multiple jobs."""
