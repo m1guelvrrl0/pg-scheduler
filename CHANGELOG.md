@@ -15,7 +15,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **🌍 Timezone support**: Schedule cron jobs in any timezone
   - Use `timezone` parameter with cron expressions (e.g., `timezone="America/New_York"`)
   - Supports both string timezone names and `ZoneInfo` objects
-  - Uses Python's built-in `zoneinfo` module (no pytz needed!)
   - Automatically converts to UTC for internal storage
 - **Enhanced `@periodic` decorator**: Now supports both interval and cron-based scheduling modes
   - Interval-based: `@periodic(every=timedelta(minutes=15))`
