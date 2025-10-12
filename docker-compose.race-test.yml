@@ -1,0 +1,104 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: scheduler
+      POSTGRES_PASSWORD: scheduler123
+      POSTGRES_DB: scheduler_db
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scheduler -d scheduler_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  # Multiple scheduler instances to test race conditions
+  scheduler-1:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - PGHOST=db
+      - PGPORT=5432
+      - PGUSER=scheduler
+      - PGPASSWORD=scheduler123
+      - PGDATABASE=scheduler_db
+      - SCHEDULER_INSTANCE=1
+    volumes:
+      - .:/app
+    command: python tests/race_conditions/test_multi_instance.py
+
+  scheduler-2:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - PGHOST=db
+      - PGPORT=5432
+      - PGUSER=scheduler
+      - PGPASSWORD=scheduler123
+      - PGDATABASE=scheduler_db
+      - SCHEDULER_INSTANCE=2
+    volumes:
+      - .:/app
+    command: python tests/race_conditions/test_multi_instance.py
+
+  scheduler-3:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - PGHOST=db
+      - PGPORT=5432
+      - PGUSER=scheduler
+      - PGPASSWORD=scheduler123
+      - PGDATABASE=scheduler_db
+      - SCHEDULER_INSTANCE=3
+    volumes:
+      - .:/app
+    command: python tests/race_conditions/test_multi_instance.py
+
+  # Add a 4th scheduler for more race condition testing
+  scheduler-4:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - PGHOST=db
+      - PGPORT=5432
+      - PGUSER=scheduler
+      - PGPASSWORD=scheduler123
+      - PGDATABASE=scheduler_db
+      - SCHEDULER_INSTANCE=4
+    volumes:
+      - .:/app
+    command: python tests/race_conditions/test_multi_instance.py
+
+  # Monitor service to verify results
+  monitor:
+    build: .
+    depends_on:
+      - scheduler-1
+      - scheduler-2
+      - scheduler-3
+      - scheduler-4
+    environment:
+      - PGHOST=db
+      - PGPORT=5432
+      - PGUSER=scheduler
+      - PGPASSWORD=scheduler123
+      - PGDATABASE=scheduler_db
+    volumes:
+      - .:/app
+    command: >
+      sh -c "sleep 125 && python tests/race_conditions/verify_results.py"
+
