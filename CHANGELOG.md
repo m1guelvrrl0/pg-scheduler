@@ -8,18 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **🎉 Cron-based scheduling**: Full support for cron expressions in `@periodic` decorator
+  - Use `cron` parameter instead of `every` (e.g., `cron="0 0 * * *"` for daily at midnight)
+  - Supports all standard cron syntax: `*/15 * * * *`, `0 9-17 * * MON-FRI`, etc.
+  - Requires `croniter>=3.0.0` dependency
+- **🌍 Timezone support**: Schedule cron jobs in any timezone
+  - Use `timezone` parameter with cron expressions (e.g., `timezone="America/New_York"`)
+  - Supports both string timezone names and `ZoneInfo` objects
+  - Uses Python's built-in `zoneinfo` module (no pytz needed!)
+  - Automatically converts to UTC for internal storage
+- **Enhanced `@periodic` decorator**: Now supports both interval and cron-based scheduling modes
+  - Interval-based: `@periodic(every=timedelta(minutes=15))`
+  - Cron-based: `@periodic(cron="0 0 * * *")`
+  - Cron with timezone: `@periodic(cron="0 3 * * SUN", timezone="America/New_York")`
 - **New priority levels**: Added `JobPriority.HIGH` and `JobPriority.LOW` for finer-grained priority control
   - `CRITICAL` (1) - Highest priority
   - `HIGH` (3) - High priority (new!)
   - `NORMAL` (5) - Default priority
   - `LOW` (8) - Low priority (new!)
-
 - **Per-job misfire grace time configuration**: Jobs can now override the scheduler's default grace time via the `misfire_grace_time` parameter in `schedule()`
 - Support for `misfire_grace_time=None` to disable job expiration entirely (APScheduler-like behavior)
 - Sentinel pattern (`_UNSET`) to distinguish between "parameter not specified" and "explicitly set to None"
 - Database migration support for `misfire_grace_time` column (automatically applied to existing databases)
-- Comprehensive test suite for misfire grace time functionality with Docker Compose multi-container testing
-- Documentation explaining misfire grace time behavior and examples
+- Comprehensive examples for cron and timezone features (`cron_example.py`)
+- Documentation with cron expression examples and timezone usage
 
 ### Changed
 - **Code organization improvements**: Major refactoring for better modularity and maintainability

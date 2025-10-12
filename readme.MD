@@ -24,10 +24,12 @@ This project is currently in **early development** (v0.1.0). While functional, p
 ## ✨ Key Features
 
 - **🔄 Periodic Jobs**: Simple `@periodic` decorator for recurring tasks
+- **⏰ Cron Scheduling**: Full cron expression support (e.g., `cron="0 0 * * *"`)
+- **🌍 Timezone Support**: Schedule jobs in any timezone using `zoneinfo`
 - **🔒 Deduplication**: Guarantees exactly one execution per window across replicas  
 - **⚡ Self-Rescheduling**: Jobs automatically schedule their next execution
 - **🛡️ Advisory Locks**: Optional PostgreSQL advisory locks for exclusive execution
-- **🎯 Priority Queues**: Support for job priorities and retry logic
+- **🎯 Priority Queues**: Support for job priorities (CRITICAL, HIGH, NORMAL, LOW)
 - **🧹 Vacuum Policies**: Automatic cleanup of completed jobs
 - **💪 Reliability**: Graceful shutdown, error handling, and orphan recovery
 
@@ -42,6 +44,7 @@ pip install pg-scheduler
 - Python 3.9+
 - PostgreSQL 12+
 - asyncpg
+- croniter (for cron-based scheduling)
 
 ## 🚀 Quick Start
 
@@ -97,6 +100,8 @@ if __name__ == "__main__":
 
 ### Periodic Jobs with @periodic Decorator
 
+#### Interval-Based Scheduling
+
 ```python
 from datetime import timedelta
 from pg_scheduler import periodic, JobPriority
@@ -114,7 +119,40 @@ async def generate_hourly_report():
     print("📊 Generating hourly report...")
     # Your report generation logic here
     print("✅ Report generated")
+```
 
+#### Cron-Based Scheduling
+
+```python
+# Daily backup at midnight UTC
+@periodic(cron="0 0 * * *")
+async def daily_backup():
+    print("🔄 Running daily backup...")
+
+# Every Sunday at 3am in New York timezone
+@periodic(cron="0 3 * * SUN", timezone="America/New_York")
+async def weekly_report():
+    print("📊 Generating weekly report (New York time)...")
+
+# Every 15 minutes using cron syntax
+@periodic(cron="*/15 * * * *")
+async def frequent_check():
+    print("✅ Running frequent health check...")
+
+# Business hours only (9am-5pm Mon-Fri) in London
+@periodic(cron="0 9-17 * * MON-FRI", timezone="Europe/London", priority=JobPriority.HIGH)
+async def business_hours_task():
+    print("💼 Running business hours task...")
+
+# First day of every month at 2am
+@periodic(cron="0 2 1 * *")
+async def monthly_cleanup():
+    print("🧹 Running monthly cleanup...")
+```
+
+#### Advisory Locks for Exclusive Execution
+
+```python
 # Advisory locks for exclusive execution
 @periodic(every=timedelta(minutes=30), use_advisory_lock=True)
 async def exclusive_maintenance():
@@ -191,8 +229,14 @@ job_id = await scheduler.trigger_periodic_job(dedup_key)
 ## 🎯 Job Scheduling Features
 
 ### Priority Support
-- `JobPriority.NORMAL` (default) or `JobPriority.CRITICAL`
-- Higher priority jobs execute first
+
+Four priority levels available (lower number = higher priority):
+- `JobPriority.CRITICAL` - Highest priority (executes first)
+- `JobPriority.HIGH` - High priority
+- `JobPriority.NORMAL` - Default priority
+- `JobPriority.LOW` - Low priority (executes last)
+
+Jobs are executed in priority order, with higher priority jobs running before lower priority ones.
 
 ### Conflict Resolution
 Handle duplicate job IDs with flexible strategies:
@@ -306,8 +350,9 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ### Planned Features
 
-- **Cron-like Scheduling**: Support for cron expressions (e.g., `@periodic(cron="0 0 * * SUN")` for "every Sunday at midnight")
-- **Timezone Support**: Specify timezones for periodic jobs
+- **Web UI**: Dashboard for monitoring jobs and scheduler status
+- **Job Dependencies**: Define job execution order and dependencies
+- **Distributed Locks**: Additional locking mechanisms for complex workflows
 
 ## 📄 License
 
