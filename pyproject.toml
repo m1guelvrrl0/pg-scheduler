@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "pg-scheduler"
 version = "0.1.0"
 description = "A PostgreSQL-based async job scheduler with deduplication, periodic jobs, and reliability features"
-readme = "README.md"
+readme = "readme.MD"
 requires-python = ">=3.9"
 license = {file = "LICENSE"}
 authors = [
