@@ -121,15 +121,15 @@ class Scheduler:
             # Start vacuum task if enabled
             if self.vacuum_enabled:
                 self.vacuum_task = asyncio.create_task(self._vacuum_loop())
-                logger.info(f"Scheduler started: worker_id={self.worker_id}, vacuum_enabled=True")
+                logger.debug(f"Scheduler started: worker_id={self.worker_id}, vacuum_enabled=True")
             else:
-                logger.info(f"Scheduler started: worker_id={self.worker_id}, vacuum_enabled=False")
+                logger.debug(f"Scheduler started: worker_id={self.worker_id}, vacuum_enabled=False")
             
             # Start periodic jobs if enabled
             if self.periodic_jobs_enabled:
                 await _periodic_registry.start_all_jobs()
                 periodic_count = len(_periodic_registry.get_jobs())
-                logger.info(f"Started {periodic_count} periodic jobs")
+                logger.debug(f"Started {periodic_count} periodic jobs")
             
         except Exception as e:
             logger.error(f"Error starting scheduler: {e}")
@@ -142,13 +142,13 @@ class Scheduler:
         if not self.is_running or self.is_shutting_down:
             return
 
-        logger.info(f"Gracefully stopping scheduler {self.worker_id}...")
+        logger.debug(f"Gracefully stopping scheduler {self.worker_id}...")
         self.is_shutting_down = True
         self.is_running = False
         
         # Wait for active jobs to complete (with timeout)
         if self.active_jobs:
-            logger.info(f"Waiting for {len(self.active_jobs)} active jobs to complete...")
+            logger.debug(f"Waiting for {len(self.active_jobs)} active jobs to complete...")
             timeout = 30  # 30 second timeout
             start_time = asyncio.get_event_loop().time()
             
@@ -160,7 +160,7 @@ class Scheduler:
         
         # Wait for any remaining active tasks to complete or cancel them
         if self.active_tasks:
-            logger.info(f"Waiting for {len(self.active_tasks)} active tasks to complete...")
+            logger.debug(f"Waiting for {len(self.active_tasks)} active tasks to complete...")
             await asyncio.wait(self.active_tasks, timeout=10, return_when=asyncio.ALL_COMPLETED)
             
             # Cancel any tasks that didn't complete
@@ -178,7 +178,7 @@ class Scheduler:
         # Mark any remaining jobs as failed (they'll be retried by other workers)
         await self._mark_remaining_jobs_failed()
         
-        logger.info(f"Scheduler {self.worker_id} stopped gracefully")
+        logger.debug(f"Scheduler {self.worker_id} stopped gracefully")
 
     async def _cleanup_background_tasks(self):
         """Clean up all background tasks"""
@@ -205,7 +205,7 @@ class Scheduler:
                 WHERE job_id = ANY($1) AND status = 'running';
             """, list(self.active_jobs))
             
-            logger.info(f"Marked {len(self.active_jobs)} jobs for retry by other workers")
+            logger.debug(f"Marked {len(self.active_jobs)} jobs for retry by other workers")
             
         except Exception as e:
             logger.error(f"Failed to mark remaining jobs as failed: {e}")
@@ -282,9 +282,9 @@ class Scheduler:
                     worker_id TEXT  -- Track which worker performed the vacuum
                 );
             """)
-            logger.info("Database initialized with reliability features and vacuum metrics")
+            logger.debug("Database initialized with vacuum metrics")
         else:
-            logger.info("Database initialized with reliability features")
+            logger.debug("Database initialized")
 
     async def _execute_with_retry(self, query: str, *args, max_retries: int = 3):
         """Execute database query with retry logic for transient failures"""
@@ -334,7 +334,7 @@ class Scheduler:
                     logger.debug(f"Recovered job {job['job_id']} ({job['job_name']}) "
                                f"from worker {job['worker_id']}")
             else:
-                logger.info("No orphaned jobs found during startup")
+                logger.debug("No orphaned jobs found during startup")
                 
         except Exception as e:
             logger.error(f"Failed to recover orphaned jobs: {e}")
@@ -420,7 +420,7 @@ class Scheduler:
             misfire_grace_time=effective_misfire_grace_time
         )
         
-        logger.info(f"Scheduled async function {func.__name__} to run at {execution_time} (priority={priority.value}, job_id={scheduled_job_id})")
+        logger.debug(f"Scheduled async function {func.__name__} to run at {execution_time} (priority={priority.value}, job_id={scheduled_job_id})")
         return scheduled_job_id
 
     async def listen_for_jobs(self):
@@ -429,7 +429,7 @@ class Scheduler:
         startup_jitter = random.uniform(0, 1.0)
         await asyncio.sleep(startup_jitter)
         
-        logger.info(f"Starting job listener [worker={self.worker_id}]")
+        logger.debug(f"Starting job listener [worker={self.worker_id}]")
         
         while self.is_running and not self.is_shutting_down:
             try:
@@ -445,7 +445,7 @@ class Scheduler:
                 ready_jobs = await self._claim_jobs(max_claimable)
                 
                 if ready_jobs:
-                    logger.info(f"Claimed {len(ready_jobs)} jobs [worker={self.worker_id}] (bulk claiming)")
+                    logger.debug(f"Claimed {len(ready_jobs)} jobs [worker={self.worker_id}] (bulk claiming)")
                     
                     # The semaphore will naturally limit concurrency
                     for job_row in ready_jobs:
@@ -564,7 +564,7 @@ class Scheduler:
                 await self._safe_mark_job_failed(job_id, error_msg)
                 return
             
-            logger.info(f"Executing job {job_id} ({job_name}) [priority={priority.value}] [worker={self.worker_id}]")
+            logger.debug(f"Executing job {job_id} ({job_name}) [priority={priority.value}] [worker={self.worker_id}]")
             
             # Execute the function with timeout protection
             args = task_data.get('args', ())
@@ -582,7 +582,7 @@ class Scheduler:
             # Atomically mark as completed
             success = await self._safe_mark_job_completed(job_id)
             if success:
-                logger.info(f"Job {job_id} completed successfully [worker={self.worker_id}]")
+                logger.debug(f"Job {job_id} completed successfully [worker={self.worker_id}]")
             else:
                 logger.warning(f"Job {job_id} completed but failed to update status - may be retried")
             
@@ -766,10 +766,10 @@ class Scheduler:
             total_deleted += deleted_count
             
             if deleted_count > 0:
-                logger.info(f"Vacuum: deleted {deleted_count} {status} jobs")
+                logger.debug(f"Vacuum: deleted {deleted_count} {status} jobs")
         
         if total_deleted > 0:
-            logger.info(f"Vacuum completed: deleted {total_deleted} total jobs")
+            logger.debug(f"Vacuum completed: deleted {total_deleted} total jobs")
 
     async def _apply_vacuum_policy(self, status: str, policy: VacuumPolicy, safety_window: datetime.datetime) -> int:
         """Apply a specific vacuum policy and return count of deleted jobs"""
@@ -889,7 +889,7 @@ class Scheduler:
                             f"Choose a different job_id or omit it for auto-generation."
                         )
                     elif conflict_resolution == ConflictResolution.IGNORE:
-                        logger.info(f"Job ID '{job_id}' already exists, ignoring new job (conflict_resolution=IGNORE)")
+                        logger.warning(f"Job ID '{job_id}' already exists, ignoring new job (conflict_resolution=IGNORE)")
                         return job_id
                     elif conflict_resolution == ConflictResolution.REPLACE:
                         # Replace/update the existing job
@@ -914,7 +914,7 @@ class Scheduler:
                             RETURNING job_id;
                         """, job_id, job_name, execution_time, json_task_data, priority.db_value, max_retries, misfire_grace_time)
                         
-                        logger.info(f"Job ID '{job_id}' replaced with new parameters (conflict_resolution=REPLACE)")
+                        logger.debug(f"Job ID '{job_id}' replaced with new parameters (conflict_resolution=REPLACE)")
                         return result[0]['job_id']
                 
                 # Insert with custom job_id (now we know it's unique)
@@ -951,7 +951,7 @@ class Scheduler:
             """, job_name, execution_time, json_task_data, priority.db_value, max_retries, misfire_grace_time)
         
         scheduled_job_id = result[0]['job_id']
-        logger.info(f"Job scheduled: {job_name} at {execution_time} (priority={priority.value}, job_id={scheduled_job_id})")
+        logger.debug(f"Job scheduled: {job_name} at {execution_time} (priority={priority.value}, job_id={scheduled_job_id})")
         return scheduled_job_id
 
     async def cancel_job(self, job_id: str) -> bool:
@@ -978,7 +978,7 @@ class Scheduler:
             
             if result:
                 cancelled_job = result[0]
-                logger.info(f"Job cancelled: {cancelled_job['job_name']} (job_id={job_id})")
+                logger.debug(f"Job cancelled: {cancelled_job['job_name']} (job_id={job_id})")
                 
                 # Remove from active jobs if it was running
                 self.active_jobs.discard(job_id)
@@ -1031,11 +1031,11 @@ class Scheduler:
             results[status] = deleted_count
             
             if deleted_count > 0:
-                logger.info(f"Manual vacuum: deleted {deleted_count} {status} jobs")
+                logger.debug(f"Manual vacuum: deleted {deleted_count} {status} jobs")
         
         total = sum(results.values())
         if total > 0:
-            logger.info(f"Manual vacuum completed: deleted {total} total jobs")
+            logger.debug(f"Manual vacuum completed: deleted {total} total jobs")
         
         return results
 
@@ -1104,7 +1104,7 @@ class Scheduler:
         jobs = _periodic_registry.get_jobs()
         if dedup_key in jobs:
             jobs[dedup_key].enabled = True
-            logger.info(f"Enabled periodic job with dedup_key: {dedup_key}")
+            logger.debug(f"Enabled periodic job with dedup_key: {dedup_key}")
             return True
         return False
     
@@ -1113,7 +1113,7 @@ class Scheduler:
         jobs = _periodic_registry.get_jobs()
         if dedup_key in jobs:
             jobs[dedup_key].enabled = False
-            logger.info(f"Disabled periodic job with dedup_key: {dedup_key}")
+            logger.debug(f"Disabled periodic job with dedup_key: {dedup_key}")
             return True
         return False
     
@@ -1137,7 +1137,7 @@ class Scheduler:
                 conflict_resolution=ConflictResolution.REPLACE
             )
             
-            logger.info(f"Manually triggered periodic job {config.job_name}: {job_id}")
+            logger.debug(f"Manually triggered periodic job {config.job_name}: {job_id}")
             return job_id
             
         except Exception as e:

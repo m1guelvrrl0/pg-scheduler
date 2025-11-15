@@ -125,7 +125,7 @@ class PeriodicJobRegistry:
         self._periodic_jobs[config.dedup_key] = config
         schedule_desc = config.cron if config.cron else f"every {config.interval}"
         tz_desc = f" ({config.timezone})" if config.timezone else ""
-        logger.info(f"Registered periodic job: {config.job_name} ({schedule_desc}{tz_desc}, dedup_key={config.dedup_key})")
+        logger.debug(f"Registered periodic job: {config.job_name} ({schedule_desc}{tz_desc}, dedup_key={config.dedup_key})")
     
     def set_scheduler(self, scheduler: 'Scheduler'):
         """Set the scheduler instance"""
@@ -205,7 +205,7 @@ class PeriodicJobRegistry:
                 priority=config.priority,
                 max_retries=config.max_retries
             )
-            logger.info(f"Scheduled periodic job {config.job_name} for {next_run}")
+            logger.debug(f"Scheduled periodic job {config.job_name} for {next_run}")
         except Exception as e:
             logger.error(f"Failed to schedule periodic job {config.job_name}: {e}")
     
@@ -243,7 +243,7 @@ class PeriodicJobRegistry:
                     lock_acquired = await self._try_acquire_advisory_lock(lock_key)
                     
                     if not lock_acquired:
-                        logger.info(f"Advisory lock for {config.job_name} already held by another worker, skipping execution")
+                        logger.debug(f"Advisory lock for {config.job_name} already held by another worker, skipping execution")
                         return  # Skip execution if lock can't be acquired
                 
                 # Execute the original function
@@ -253,7 +253,7 @@ class PeriodicJobRegistry:
                     # Handle sync functions
                     config.func()
                 
-                logger.info(f"Periodic job {config.job_name} completed successfully")
+                logger.debug(f"Periodic job {config.job_name} completed successfully")
                 
             except Exception as e:
                 logger.error(f"Periodic job {config.job_name} failed: {e}")
