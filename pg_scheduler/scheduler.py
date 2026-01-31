@@ -37,7 +37,8 @@ class Scheduler:
                  max_concurrent_jobs: int = 25, 
                  misfire_grace_time: Optional[int] = 300,  # 5 minutes default, None = no expiration
                  vacuum_config: Optional[VacuumConfig] = None,
-                 vacuum_enabled: bool = True):
+                 vacuum_enabled: bool = True,
+                 batch_claim_limit: int = 10):
         """
         Initialize the Scheduler with concurrency control and reliability features.
         
@@ -48,6 +49,7 @@ class Scheduler:
                               Set to None for no expiration. Can be overridden per-job.
             vacuum_config: Configuration for job cleanup policies (uses defaults if None)
             vacuum_enabled: Whether to enable automatic vacuum cleanup
+            batch_claim_limit: Maximum number of jobs to claim in a single batch (default 10)
         """
         self.db_pool = db_pool
         self.task_map = {}  # Store task functions
@@ -64,6 +66,9 @@ class Scheduler:
         
         # Job expiration policy
         self.misfire_grace_time = misfire_grace_time
+        
+        # Batch claiming configuration
+        self.batch_claim_limit = batch_claim_limit
         
         # Vacuum configuration
         self.vacuum_enabled = vacuum_enabled
@@ -84,7 +89,8 @@ class Scheduler:
         self.shutdown_task = None
         
         logger.info(f"Scheduler initialized: worker_id={self.worker_id}, "
-                   f"max_concurrent={max_concurrent_jobs}, misfire_grace={misfire_grace_time}s")
+                   f"max_concurrent={max_concurrent_jobs}, batch_claim_limit={batch_claim_limit}, "
+                   f"misfire_grace={misfire_grace_time}s")
 
     def _setup_signal_handlers(self):
         """Setup signal handlers for graceful shutdown"""
@@ -424,7 +430,7 @@ class Scheduler:
         return scheduled_job_id
 
     async def listen_for_jobs(self):
-        """Listen for jobs with reliability and optimized bulk claiming"""
+        """Listen for jobs with bulk claiming"""
         
         startup_jitter = random.uniform(0, 1.0)
         await asyncio.sleep(startup_jitter)
@@ -439,7 +445,7 @@ class Scheduler:
                     await asyncio.sleep(1.0)
                     continue
                 
-                max_claimable = min(available_slots, 5)  # Cap at 5 for reasonable batch size
+                max_claimable = min(available_slots, self.batch_claim_limit)
                 
                 # Claim jobs from database
                 ready_jobs = await self._claim_jobs(max_claimable)

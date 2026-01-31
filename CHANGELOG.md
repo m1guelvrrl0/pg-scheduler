@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Configurable batch claiming**: New `batch_claim_limit` parameter in `Scheduler.__init__` to control max jobs claimed per batch (default: 10)
 - **🎉 Cron-based scheduling**: Full support for cron expressions in `@periodic` decorator
   - Use `cron` parameter instead of `every` (e.g., `cron="0 0 * * *"` for daily at midnight)
   - Supports all standard cron syntax: `*/15 * * * *`, `0 9-17 * * MON-FRI`, etc.
