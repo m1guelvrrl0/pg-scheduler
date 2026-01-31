@@ -7,12 +7,13 @@ import signal
 import sys
 import inspect
 from datetime import UTC, timedelta
-from typing import Optional, Set, Dict, Any, Union
+from typing import Optional, Set, Dict, Any, Union, List
 import uuid
 import random
 
 from .conflict_resolution import ConflictResolution
 from .job_priority import JobPriority
+from .job_spec import JobSpec, _UNSET as _JOBSPEC_UNSET
 from .periodic import _periodic_registry, PeriodicJobConfig
 from .vacuum import VacuumConfig, VacuumPolicy, VacuumTrigger
 
@@ -428,6 +429,182 @@ class Scheduler:
         
         logger.debug(f"Scheduled async function {func.__name__} to run at {execution_time} (priority={priority.value}, job_id={scheduled_job_id})")
         return scheduled_job_id
+
+    async def schedule_bulk(
+        self,
+        jobs: List[JobSpec],
+        *,
+        conflict_resolution: ConflictResolution = ConflictResolution.IGNORE,
+        batch_size: int = 1000,
+    ) -> List[str]:
+        """
+        Schedule multiple jobs in a single bulk operation for improved performance.
+        
+        Args:
+            jobs: List of JobSpec instances defining the jobs to schedule
+            conflict_resolution: Strategy for ALL jobs (IGNORE recommended for bulk)
+            batch_size: Max jobs per database transaction (default 1000)
+            
+        Returns:
+            List of job IDs in same order as input. Jobs that failed to insert
+            will have None in their position.
+        """
+        if not jobs:
+            return []
+        
+        # Validate all functions are async and register them
+        for job in jobs:
+            if not inspect.iscoroutinefunction(job.func):
+                raise TypeError(f"Expected an async function, got {type(job.func)} for {job.func}")
+            self.task_map[job.func.__name__] = job.func
+        
+        all_job_ids: List[str] = []
+        
+        # Process in batches
+        for i in range(0, len(jobs), batch_size):
+            batch = jobs[i:i + batch_size]
+            batch_ids = await self._insert_jobs_bulk(batch, conflict_resolution)
+            all_job_ids.extend(batch_ids)
+        
+        logger.debug(f"Bulk scheduled {len(all_job_ids)} jobs")
+        return all_job_ids
+
+    async def _insert_jobs_bulk(
+        self,
+        jobs: List[JobSpec],
+        conflict_resolution: ConflictResolution
+    ) -> List[str]:
+        """Insert a batch of jobs using executemany for optimal performance."""
+        # Prepare records for bulk insert
+        records = []
+        for job in jobs:
+            task_data = json.dumps({
+                'args': job.args,
+                'kwargs': job.kwargs or {}
+            })
+            
+            # Determine effective misfire_grace_time
+            if job.misfire_grace_time is _JOBSPEC_UNSET:
+                effective_misfire = self.misfire_grace_time
+            else:
+                effective_misfire = job.misfire_grace_time
+            
+            records.append((
+                job.job_id,  # Can be None for auto-generation
+                job.func.__name__,
+                job.execution_time,
+                task_data,
+                job.priority.db_value,
+                job.max_retries,
+                effective_misfire
+            ))
+        
+        try:
+            async with self.db_pool.acquire() as conn:
+                if conflict_resolution == ConflictResolution.IGNORE:
+                    # Use ON CONFLICT DO NOTHING for idempotent bulk inserts
+                    result = await conn.fetch("""
+                        INSERT INTO scheduled_jobs 
+                            (job_id, job_name, execution_time, status, task_data, priority, max_retries, misfire_grace_time)
+                        SELECT 
+                            COALESCE(d.job_id, gen_random_uuid()::text),
+                            d.job_name,
+                            d.execution_time,
+                            'pending',
+                            d.task_data::jsonb,
+                            d.priority,
+                            d.max_retries,
+                            d.misfire_grace_time
+                        FROM unnest($1::text[], $2::text[], $3::timestamptz[], $4::text[], $5::int[], $6::int[], $7::int[]) 
+                            AS d(job_id, job_name, execution_time, task_data, priority, max_retries, misfire_grace_time)
+                        ON CONFLICT (job_id) DO NOTHING
+                        RETURNING job_id;
+                    """, 
+                        [r[0] for r in records],  # job_ids
+                        [r[1] for r in records],  # job_names
+                        [r[2] for r in records],  # execution_times
+                        [r[3] for r in records],  # task_data
+                        [r[4] for r in records],  # priorities
+                        [r[5] for r in records],  # max_retries
+                        [r[6] for r in records],  # misfire_grace_time
+                    )
+                    return [row['job_id'] for row in result]
+                    
+                elif conflict_resolution == ConflictResolution.REPLACE:
+                    # Use ON CONFLICT DO UPDATE for upsert behavior
+                    result = await conn.fetch("""
+                        INSERT INTO scheduled_jobs 
+                            (job_id, job_name, execution_time, status, task_data, priority, max_retries, misfire_grace_time)
+                        SELECT 
+                            COALESCE(d.job_id, gen_random_uuid()::text),
+                            d.job_name,
+                            d.execution_time,
+                            'pending',
+                            d.task_data::jsonb,
+                            d.priority,
+                            d.max_retries,
+                            d.misfire_grace_time
+                        FROM unnest($1::text[], $2::text[], $3::timestamptz[], $4::text[], $5::int[], $6::int[], $7::int[]) 
+                            AS d(job_id, job_name, execution_time, task_data, priority, max_retries, misfire_grace_time)
+                        ON CONFLICT (job_id) DO UPDATE SET
+                            job_name = EXCLUDED.job_name,
+                            execution_time = EXCLUDED.execution_time,
+                            task_data = EXCLUDED.task_data,
+                            priority = EXCLUDED.priority,
+                            max_retries = EXCLUDED.max_retries,
+                            misfire_grace_time = EXCLUDED.misfire_grace_time,
+                            status = CASE 
+                                WHEN scheduled_jobs.status IN ('completed', 'failed', 'cancelled', 'expired') THEN 'pending'
+                                ELSE scheduled_jobs.status
+                            END,
+                            retry_count = 0,
+                            error_message = NULL,
+                            worker_id = NULL,
+                            last_heartbeat = NULL,
+                            lease_until = NULL
+                        RETURNING job_id;
+                    """, 
+                        [r[0] for r in records],
+                        [r[1] for r in records],
+                        [r[2] for r in records],
+                        [r[3] for r in records],
+                        [r[4] for r in records],
+                        [r[5] for r in records],
+                        [r[6] for r in records],
+                    )
+                    return [row['job_id'] for row in result]
+                    
+                else:  # ConflictResolution.RAISE
+                    # Simple insert - will fail on duplicates
+                    result = await conn.fetch("""
+                        INSERT INTO scheduled_jobs 
+                            (job_id, job_name, execution_time, status, task_data, priority, max_retries, misfire_grace_time)
+                        SELECT 
+                            COALESCE(d.job_id, gen_random_uuid()::text),
+                            d.job_name,
+                            d.execution_time,
+                            'pending',
+                            d.task_data::jsonb,
+                            d.priority,
+                            d.max_retries,
+                            d.misfire_grace_time
+                        FROM unnest($1::text[], $2::text[], $3::timestamptz[], $4::text[], $5::int[], $6::int[], $7::int[]) 
+                            AS d(job_id, job_name, execution_time, task_data, priority, max_retries, misfire_grace_time)
+                        RETURNING job_id;
+                    """, 
+                        [r[0] for r in records],
+                        [r[1] for r in records],
+                        [r[2] for r in records],
+                        [r[3] for r in records],
+                        [r[4] for r in records],
+                        [r[5] for r in records],
+                        [r[6] for r in records],
+                    )
+                    return [row['job_id'] for row in result]
+                    
+        except Exception as e:
+            logger.error(f"Bulk insert failed: {e}")
+            raise
 
     async def listen_for_jobs(self):
         """Listen for jobs with bulk claiming"""

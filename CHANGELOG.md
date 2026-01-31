@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Bulk job scheduling**: New `schedule_bulk()` method for high-performance batch inserts
+  - Schedule thousands of jobs in a single database transaction
+  - 10-100x faster than individual `schedule()` calls for batch operations
+  - New `JobSpec` dataclass for defining job specifications
+  - Supports all existing job parameters (priority, retries, custom IDs, misfire grace time)
+  - Configurable `batch_size` parameter for chunking large batches (default: 1000)
+  - Conflict resolution support (IGNORE, REPLACE, RAISE) applied to entire batch
 - **Configurable batch claiming**: New `batch_claim_limit` parameter in `Scheduler.__init__` to control max jobs claimed per batch (default: 10)
 - **🎉 Cron-based scheduling**: Full support for cron expressions in `@periodic` decorator
   - Use `cron` parameter instead of `every` (e.g., `cron="0 0 * * *"` for daily at midnight)

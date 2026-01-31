@@ -13,6 +13,7 @@ This library provides a robust job scheduling system built on PostgreSQL with fe
 
 from .conflict_resolution import ConflictResolution
 from .job_priority import JobPriority
+from .job_spec import JobSpec
 from .periodic import periodic
 from .vacuum import VacuumConfig, VacuumPolicy, VacuumTrigger
 from .scheduler import Scheduler
@@ -24,6 +25,7 @@ __email__ = "miguel.python.dev@gmail.com"
 __all__ = [
     "Scheduler",
     "JobPriority", 
+    "JobSpec",
     "ConflictResolution",
     "VacuumPolicy",
     "VacuumConfig", 
