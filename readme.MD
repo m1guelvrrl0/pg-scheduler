@@ -16,10 +16,9 @@ This library is focused on easy to use and deploy scheduler and not being an all
 
 ## ⚠️ Project Status
 
-This project is currently in **early development** (v0.1.0). While functional, please note:
-- The API may change in future versions
-- Recommended for testing and development environments
-- Production use should be carefully evaluated
+This project is currently in **active development** (v0.2.0). While functional and production-tested, please note:
+- The API is stabilizing but may still change in future versions
+- Recommended for both development and production environments with proper testing
 
 ## ✨ Key Features
 

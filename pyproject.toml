@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pg-scheduler"
-version = "0.1.0"
+version = "0.2.0"
 description = "A PostgreSQL-based async job scheduler with deduplication, periodic jobs, and reliability features"
 readme = "readme.MD"
 requires-python = ">=3.9"
