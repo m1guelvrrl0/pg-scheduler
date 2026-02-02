@@ -1,1 +1,2 @@
 asyncpg==0.30.0
+croniter>=3.0.0  # For cron expression parsing

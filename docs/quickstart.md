@@ -131,12 +131,31 @@ When you run this example:
 
 ## Common Patterns
 
-### High-Priority Jobs
+### Priority Levels
 
 ```python
+# Critical priority - executes first
 @periodic(every=timedelta(minutes=5), priority=JobPriority.CRITICAL)
 async def monitor_system():
     """Critical system monitoring"""
+    pass
+
+# High priority
+@periodic(every=timedelta(minutes=15), priority=JobPriority.HIGH)
+async def important_task():
+    """Important but not critical"""
+    pass
+
+# Normal priority (default)
+@periodic(every=timedelta(hours=1), priority=JobPriority.NORMAL)
+async def regular_task():
+    """Regular background task"""
+    pass
+
+# Low priority - executes last
+@periodic(every=timedelta(hours=6), priority=JobPriority.LOW)
+async def cleanup_task():
+    """Low priority cleanup"""
     pass
 ```
 

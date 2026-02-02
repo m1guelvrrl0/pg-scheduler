@@ -7,14 +7,18 @@ import signal
 import sys
 import inspect
 from datetime import UTC, timedelta
-from typing import Optional, Set, Dict, Callable, Any
-from enum import Enum
-from dataclasses import dataclass
+from typing import Optional, Set, Dict, Any, Union, List
 import uuid
 import random
-import hashlib
-import functools
-import struct
+
+from .conflict_resolution import ConflictResolution
+from .job_priority import JobPriority
+from .job_spec import JobSpec, _UNSET as _JOBSPEC_UNSET
+from .periodic import _periodic_registry, PeriodicJobConfig
+from .vacuum import VacuumConfig, VacuumPolicy, VacuumTrigger
+
+# Sentinel value to distinguish "not specified" from "explicitly None"
+_UNSET = object()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,318 +26,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class JobPriority(Enum):
-    # TODO: Implement enums at DB level, maybe more priority levels?
-    """User-friendly job priority levels"""
-    NORMAL = "normal"      # Default priority (value: 5)
-    CRITICAL = "critical"  # High priority (value: 1) - lower numbers = higher priority
-    
-    @property
-    def db_value(self) -> int:
-        """Convert enum to database integer value (lower = higher priority)"""
-        return {"normal": 5, "critical": 1}[self.value]
-    
-    @classmethod
-    def from_db_value(cls, db_value: int) -> 'JobPriority':
-        """Convert database integer back to enum"""
-        mapping = {5: cls.NORMAL, 1: cls.CRITICAL}
-        return mapping.get(db_value, cls.NORMAL)
-
-class ConflictResolution(Enum):
-    """Strategies for handling duplicate job_id conflicts"""
-    RAISE = "raise"        # Raise ValueError (default, safest)
-    IGNORE = "ignore"      # Ignore the new job, return existing job_id  
-    REPLACE = "replace"    # Replace/update the existing job with new parameters
-
-class VacuumTrigger(Enum):
-    """Vacuum policy trigger types"""
-    IMMEDIATE = "immediate"      # Delete immediately on status change
-    TIME_BASED = "time_based"    # Delete after X time
-    COUNT_BASED = "count_based"  # Keep only last N jobs
-    NEVER = "never"              # No automatic cleanup
-
-@dataclass
-class VacuumPolicy:
-    """Configuration for a vacuum policy"""
-    trigger: VacuumTrigger
-    days: Optional[int] = None           # For TIME_BASED policies
-    keep_count: Optional[int] = None     # For COUNT_BASED policies
-    
-    @classmethod
-    def immediate(cls) -> 'VacuumPolicy':
-        """Delete immediately when job reaches this status"""
-        return cls(VacuumTrigger.IMMEDIATE)
-        
-    @classmethod  
-    def after_days(cls, days: int) -> 'VacuumPolicy':
-        """Delete jobs after N days in this status"""
-        return cls(VacuumTrigger.TIME_BASED, days=days)
-        
-    @classmethod
-    def keep_last(cls, count: int) -> 'VacuumPolicy':
-        """Keep only the last N jobs per job_name in this status"""
-        return cls(VacuumTrigger.COUNT_BASED, keep_count=count)
-        
-    @classmethod
-    def never(cls) -> 'VacuumPolicy':
-        """Never automatically clean jobs in this status"""
-        return cls(VacuumTrigger.NEVER)
-
-@dataclass
-class VacuumConfig:
-    """Complete vacuum configuration for the scheduler"""
-    completed: VacuumPolicy = None       # Will default to after_days(1)
-    failed: VacuumPolicy = None          # Will default to after_days(7)  
-    cancelled: VacuumPolicy = None       # Will default to after_days(3)
-    interval_minutes: int = 60           # How often to run vacuum
-    track_metrics: bool = False          # Whether to store vacuum metrics in DB
-    
-    def __post_init__(self):
-        """Set sensible defaults for None policies"""
-        if self.completed is None:
-            self.completed = VacuumPolicy.after_days(1)
-        if self.failed is None:
-            self.failed = VacuumPolicy.after_days(7)
-        if self.cancelled is None:
-            self.cancelled = VacuumPolicy.after_days(3)
-
-@dataclass
-class PeriodicJobConfig:
-    """Configuration for a periodic job"""
-    func: Callable
-    interval: timedelta
-    use_advisory_lock: bool = False # Unadvisable unless you need Master node pattern where only a specific instance can run this for whatever reason.
-    priority: 'JobPriority' = None  # Will default to JobPriority.NORMAL
-    max_retries: int = 0
-    job_name: Optional[str] = None  # Auto-generated from function name if None
-    dedup_key: Optional[str] = None  # Auto-generated if None
-    enabled: bool = True
-    
-    def __post_init__(self):
-        """Set defaults and generate dedup key"""
-        if self.priority is None:
-            # Import here to avoid circular import
-            self.priority = JobPriority.NORMAL
-        if self.job_name is None:
-            self.job_name = f"periodic_{self.func.__name__}"
-        if self.dedup_key is None:
-            # Generate deterministic dedup key based on function and interval
-            func_signature = f"{self.func.__module__}.{self.func.__name__}"
-            interval_str = f"{self.interval.total_seconds()}"
-            key_material = f"{func_signature}:{interval_str}"
-            self.dedup_key = hashlib.sha256(key_material.encode()).hexdigest()[:16]
-
-class PeriodicJobRegistry:
-    """Registry for periodic jobs"""
-    def __init__(self):
-        self._periodic_jobs: Dict[str, PeriodicJobConfig] = {}
-        self._scheduler: Optional['Scheduler'] = None
-    
-    def register(self, config: PeriodicJobConfig):
-        """Register a periodic job"""
-        self._periodic_jobs[config.dedup_key] = config
-        logger.info(f"Registered periodic job: {config.job_name} (every {config.interval}, dedup_key={config.dedup_key})")
-    
-    def set_scheduler(self, scheduler: 'Scheduler'):
-        """Set the scheduler instance"""
-        self._scheduler = scheduler
-    
-    def get_jobs(self) -> Dict[str, PeriodicJobConfig]:
-        """Get all registered periodic jobs"""
-        return self._periodic_jobs.copy()
-    
-    async def start_all_jobs(self):
-        """Start all enabled periodic jobs"""
-        if not self._scheduler:
-            raise RuntimeError("No scheduler set on periodic job registry")
-        
-        for config in self._periodic_jobs.values():
-            if config.enabled:
-                await self._start_periodic_job(config)
-    
-    async def _start_periodic_job(self, config: PeriodicJobConfig):
-        """Start a single periodic job"""
-        # Calculate next execution time
-        next_run = datetime.datetime.now(UTC) + config.interval
-        
-        # Create dedup job ID for this window
-        window_key = self._get_window_key(next_run, config.interval)
-        job_id = f"periodic:{config.dedup_key}:{window_key}"
-        
-        try:
-            await self._scheduler.schedule(
-                self._create_periodic_wrapper(config),
-                execution_time=next_run,
-                job_id=job_id,
-                conflict_resolution=ConflictResolution.IGNORE,  # Dedup across replicas
-                priority=config.priority,
-                max_retries=config.max_retries
-            )
-            logger.info(f"Scheduled periodic job {config.job_name} for {next_run}")
-        except Exception as e:
-            logger.error(f"Failed to schedule periodic job {config.job_name}: {e}")
-    
-    def _get_window_key(self, execution_time: datetime.datetime, interval: timedelta) -> str:
-        """Generate a window key for deduplication within time windows"""
-        # Round down to the nearest interval boundary
-        epoch = datetime.datetime(1970, 1, 1, tzinfo=UTC)
-        seconds_since_epoch = (execution_time - epoch).total_seconds()
-        interval_seconds = interval.total_seconds()
-        window_number = int(seconds_since_epoch // interval_seconds)
-        return str(window_number)
-    
-    def _create_periodic_wrapper(self, config: PeriodicJobConfig):
-        """Create a wrapper function that handles periodic job execution and rescheduling"""
-        @functools.wraps(config.func)
-        async def periodic_wrapper():
-            lock_acquired = False
-            lock_key = None
-            
-            try:
-                # If advisory lock is enabled, try to acquire lock
-                if config.use_advisory_lock:
-                    lock_key = self._get_advisory_lock_key(config)
-                    lock_acquired = await self._try_acquire_advisory_lock(lock_key)
-                    
-                    if not lock_acquired:
-                        logger.info(f"Advisory lock for {config.job_name} already held by another worker, skipping execution")
-                        return  # Skip execution if lock can't be acquired
-                
-                # Execute the original function
-                if inspect.iscoroutinefunction(config.func):
-                    await config.func()
-                else:
-                    # Handle sync functions
-                    config.func()
-                
-                logger.info(f"Periodic job {config.job_name} completed successfully")
-                
-            except Exception as e:
-                logger.error(f"Periodic job {config.job_name} failed: {e}")
-                raise  # Re-raise to let scheduler handle retries
-            
-            finally:
-                # Release advisory lock if it was acquired
-                if config.use_advisory_lock and lock_acquired and lock_key:
-                    await self._release_advisory_lock(lock_key)
-                
-                # Always reschedule for next execution (self-rescheduling)
-                if config.enabled:
-                    await self._reschedule_periodic_job(config)
-        
-        # Set function name for scheduler registration
-        periodic_wrapper.__name__ = f"periodic_{config.func.__name__}"
-        return periodic_wrapper
-    
-    def _get_advisory_lock_key(self, config: PeriodicJobConfig) -> int:
-        """Generate a numeric lock key for PostgreSQL advisory locks"""
-        # PostgreSQL advisory locks use bigint (int8), so we need a numeric key
-        # Hash the dedup_key to get a consistent numeric value
-        hash_bytes = hashlib.sha256(config.dedup_key.encode()).digest()[:8]
-        return struct.unpack('>q', hash_bytes)[0]  # Convert to signed 64-bit int
-    
-    async def _try_acquire_advisory_lock(self, lock_key: int) -> bool:
-        """Try to acquire a PostgreSQL advisory lock (non-blocking)"""
-        try:
-            result = await self._scheduler.db_pool.fetchval(
-                "SELECT pg_try_advisory_lock($1);", lock_key
-            )
-            return bool(result)
-        except Exception as e:
-            logger.error(f"Failed to acquire advisory lock {lock_key}: {e}")
-            return False
-    
-    async def _release_advisory_lock(self, lock_key: int):
-        """Release a PostgreSQL advisory lock"""
-        try:
-            await self._scheduler.db_pool.execute(
-                "SELECT pg_advisory_unlock($1);", lock_key
-            )
-        except Exception as e:
-            logger.error(f"Failed to release advisory lock {lock_key}: {e}")
-    
-    async def _reschedule_periodic_job(self, config: PeriodicJobConfig):
-        """Reschedule the periodic job for the next execution"""
-        try:
-            next_run = datetime.datetime.now(UTC) + config.interval
-            window_key = self._get_window_key(next_run, config.interval)
-            job_id = f"periodic:{config.dedup_key}:{window_key}"
-            
-            await self._scheduler.schedule(
-                self._create_periodic_wrapper(config),
-                execution_time=next_run,
-                job_id=job_id,
-                conflict_resolution=ConflictResolution.IGNORE,
-                priority=config.priority,
-                max_retries=config.max_retries
-            )
-            logger.debug(f"Rescheduled periodic job {config.job_name} for {next_run}")
-            
-        except Exception as e:
-            logger.error(f"Failed to reschedule periodic job {config.job_name}: {e}")
-
-# Global registry instance
-_periodic_registry = PeriodicJobRegistry()
-
-def periodic(every: timedelta, 
-            use_advisory_lock: bool = False,
-            priority: JobPriority = JobPriority.NORMAL,
-            max_retries: int = 0,
-            job_name: Optional[str] = None,
-            dedup_key: Optional[str] = None,
-            enabled: bool = True) -> Callable:
-    """
-    Decorator to mark an async function as a periodic job.
-    
-    Features:
-    - Guarantees exactly one enqueue per window across many replicas (via dedup key)
-    - Self-reschedules at the end of each run
-    - Optional advisory-lock protection (alternative to dedup)
-    
-    Args:
-        every: Time interval between executions (timedelta)
-        use_advisory_lock: Use PostgreSQL advisory locks instead of dedup (future feature)
-        priority: Job priority (JobPriority.NORMAL or JobPriority.CRITICAL)
-        max_retries: Maximum retry attempts for failed executions
-        job_name: Custom job name (auto-generated from function name if None)
-        dedup_key: Custom deduplication key (auto-generated if None)
-        enabled: Whether the periodic job is enabled
-    
-    Example:
-        @periodic(every=timedelta(minutes=15))
-        async def cleanup_temp_files():
-            # Your periodic task code here
-            pass
-            
-        @periodic(every=timedelta(hours=1), priority=JobPriority.CRITICAL, max_retries=3)
-        async def generate_daily_report():
-            # Critical periodic task with retries
-            pass
-    """
-    def decorator(func: Callable) -> Callable:
-        # Validate function is async
-        if not inspect.iscoroutinefunction(func):
-            raise TypeError(f"@periodic can only be applied to async functions, got {type(func)}")
-        
-        # Create periodic job configuration
-        config = PeriodicJobConfig(
-            func=func,
-            interval=every,
-            use_advisory_lock=use_advisory_lock,
-            priority=priority,
-            max_retries=max_retries,
-            job_name=job_name,
-            dedup_key=dedup_key,
-            enabled=enabled
-        )
-        
-        # Register with global registry
-        _periodic_registry.register(config)
-        
-        # Return the original function (it's still callable directly)
-        return func
-    
-    return decorator
 
 class Scheduler:
     HEARTBEAT_THRESHOLD = 120  # 2 minutes (in seconds)
@@ -344,18 +36,21 @@ class Scheduler:
     def __init__(self, 
                  db_pool: asyncpg.Pool, 
                  max_concurrent_jobs: int = 25, 
-                 misfire_grace_time: int = 300,  # 5 minutes default
+                 misfire_grace_time: Optional[int] = 300,  # 5 minutes default, None = no expiration
                  vacuum_config: Optional[VacuumConfig] = None,
-                 vacuum_enabled: bool = True):
+                 vacuum_enabled: bool = True,
+                 batch_claim_limit: int = 10):
         """
         Initialize the Scheduler with concurrency control and reliability features.
         
         Args:
             db_pool: Connection to the PostgreSQL database.
             max_concurrent_jobs: Maximum number of jobs to run concurrently
-            misfire_grace_time: Seconds after execution_time before jobs expire (like APScheduler)
+            misfire_grace_time: Default seconds after execution_time before jobs expire.
+                              Set to None for no expiration. Can be overridden per-job.
             vacuum_config: Configuration for job cleanup policies (uses defaults if None)
             vacuum_enabled: Whether to enable automatic vacuum cleanup
+            batch_claim_limit: Maximum number of jobs to claim in a single batch (default 10)
         """
         self.db_pool = db_pool
         self.task_map = {}  # Store task functions
@@ -372,6 +67,9 @@ class Scheduler:
         
         # Job expiration policy
         self.misfire_grace_time = misfire_grace_time
+        
+        # Batch claiming configuration
+        self.batch_claim_limit = batch_claim_limit
         
         # Vacuum configuration
         self.vacuum_enabled = vacuum_enabled
@@ -392,7 +90,8 @@ class Scheduler:
         self.shutdown_task = None
         
         logger.info(f"Scheduler initialized: worker_id={self.worker_id}, "
-                   f"max_concurrent={max_concurrent_jobs}, misfire_grace={misfire_grace_time}s")
+                   f"max_concurrent={max_concurrent_jobs}, batch_claim_limit={batch_claim_limit}, "
+                   f"misfire_grace={misfire_grace_time}s")
 
     def _setup_signal_handlers(self):
         """Setup signal handlers for graceful shutdown"""
@@ -429,15 +128,15 @@ class Scheduler:
             # Start vacuum task if enabled
             if self.vacuum_enabled:
                 self.vacuum_task = asyncio.create_task(self._vacuum_loop())
-                logger.info(f"Scheduler started: worker_id={self.worker_id}, vacuum_enabled=True")
+                logger.debug(f"Scheduler started: worker_id={self.worker_id}, vacuum_enabled=True")
             else:
-                logger.info(f"Scheduler started: worker_id={self.worker_id}, vacuum_enabled=False")
+                logger.debug(f"Scheduler started: worker_id={self.worker_id}, vacuum_enabled=False")
             
             # Start periodic jobs if enabled
             if self.periodic_jobs_enabled:
                 await _periodic_registry.start_all_jobs()
                 periodic_count = len(_periodic_registry.get_jobs())
-                logger.info(f"Started {periodic_count} periodic jobs")
+                logger.debug(f"Started {periodic_count} periodic jobs")
             
         except Exception as e:
             logger.error(f"Error starting scheduler: {e}")
@@ -450,13 +149,13 @@ class Scheduler:
         if not self.is_running or self.is_shutting_down:
             return
 
-        logger.info(f"Gracefully stopping scheduler {self.worker_id}...")
+        logger.debug(f"Gracefully stopping scheduler {self.worker_id}...")
         self.is_shutting_down = True
         self.is_running = False
         
         # Wait for active jobs to complete (with timeout)
         if self.active_jobs:
-            logger.info(f"Waiting for {len(self.active_jobs)} active jobs to complete...")
+            logger.debug(f"Waiting for {len(self.active_jobs)} active jobs to complete...")
             timeout = 30  # 30 second timeout
             start_time = asyncio.get_event_loop().time()
             
@@ -468,7 +167,7 @@ class Scheduler:
         
         # Wait for any remaining active tasks to complete or cancel them
         if self.active_tasks:
-            logger.info(f"Waiting for {len(self.active_tasks)} active tasks to complete...")
+            logger.debug(f"Waiting for {len(self.active_tasks)} active tasks to complete...")
             await asyncio.wait(self.active_tasks, timeout=10, return_when=asyncio.ALL_COMPLETED)
             
             # Cancel any tasks that didn't complete
@@ -486,7 +185,7 @@ class Scheduler:
         # Mark any remaining jobs as failed (they'll be retried by other workers)
         await self._mark_remaining_jobs_failed()
         
-        logger.info(f"Scheduler {self.worker_id} stopped gracefully")
+        logger.debug(f"Scheduler {self.worker_id} stopped gracefully")
 
     async def _cleanup_background_tasks(self):
         """Clean up all background tasks"""
@@ -513,7 +212,7 @@ class Scheduler:
                 WHERE job_id = ANY($1) AND status = 'running';
             """, list(self.active_jobs))
             
-            logger.info(f"Marked {len(self.active_jobs)} jobs for retry by other workers")
+            logger.debug(f"Marked {len(self.active_jobs)} jobs for retry by other workers")
             
         except Exception as e:
             logger.error(f"Failed to mark remaining jobs as failed: {e}")
@@ -534,8 +233,23 @@ class Scheduler:
                 retry_count INTEGER DEFAULT 0,
                 max_retries INTEGER DEFAULT 0,
                 worker_id TEXT,  -- Track which worker is processing
-                error_message TEXT -- Track last error for debugging
+                error_message TEXT, -- Track last error for debugging
+                misfire_grace_time INTEGER  -- Per-job misfire grace time in seconds, NULL = no expiration
             );
+        """)
+        
+        # Add misfire_grace_time column if it doesn't exist (migration for existing tables)
+        await self._execute_with_retry("""
+            DO $$ 
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name = 'scheduled_jobs' 
+                    AND column_name = 'misfire_grace_time'
+                ) THEN
+                    ALTER TABLE scheduled_jobs ADD COLUMN misfire_grace_time INTEGER;
+                END IF;
+            END $$;
         """)
         
         # Create indexes for reliability and performance
@@ -575,9 +289,9 @@ class Scheduler:
                     worker_id TEXT  -- Track which worker performed the vacuum
                 );
             """)
-            logger.info("Database initialized with reliability features and vacuum metrics")
+            logger.debug("Database initialized with vacuum metrics")
         else:
-            logger.info("Database initialized with reliability features")
+            logger.debug("Database initialized")
 
     async def _execute_with_retry(self, query: str, *args, max_retries: int = 3):
         """Execute database query with retry logic for transient failures"""
@@ -627,7 +341,7 @@ class Scheduler:
                     logger.debug(f"Recovered job {job['job_id']} ({job['job_name']}) "
                                f"from worker {job['worker_id']}")
             else:
-                logger.info("No orphaned jobs found during startup")
+                logger.debug("No orphaned jobs found during startup")
                 
         except Exception as e:
             logger.error(f"Failed to recover orphaned jobs: {e}")
@@ -657,7 +371,8 @@ class Scheduler:
         priority: JobPriority = JobPriority.NORMAL,
         max_retries: int = 0,
         job_id: Optional[str] = None,
-        conflict_resolution: ConflictResolution = ConflictResolution.RAISE
+        conflict_resolution: ConflictResolution = ConflictResolution.RAISE,
+        misfire_grace_time: Union[int, None, object] = _UNSET
     ) -> str:
         """
         Schedule an async I/O function to run at a specific time.
@@ -671,6 +386,10 @@ class Scheduler:
             max_retries: Maximum retry attempts for failed jobs
             job_id: Optional custom job ID (auto-generated if not provided)
             conflict_resolution: How to handle duplicate job_id (RAISE, IGNORE, REPLACE)
+            misfire_grace_time: Seconds after execution_time before job expires.
+                              - Not specified (default): uses scheduler's misfire_grace_time
+                              - Explicit integer (e.g., 60): job expires after N seconds
+                              - Explicit None: job never expires
             
         Returns:
             str: The job ID of the scheduled job
@@ -687,6 +406,15 @@ class Scheduler:
             'kwargs': kwargs or {}
         }
         
+        # Determine effective misfire_grace_time
+        # _UNSET = use scheduler default
+        # None = explicit no expiration
+        # int = explicit per-job grace time
+        if misfire_grace_time is _UNSET:
+            effective_misfire_grace_time = self.misfire_grace_time
+        else:
+            effective_misfire_grace_time = misfire_grace_time
+        
         # Schedule the job in the database
         scheduled_job_id = await self.schedule_job(
             func.__name__, 
@@ -695,19 +423,196 @@ class Scheduler:
             priority=priority,
             max_retries=max_retries,
             job_id=job_id,
-            conflict_resolution=conflict_resolution
+            conflict_resolution=conflict_resolution,
+            misfire_grace_time=effective_misfire_grace_time
         )
         
-        logger.info(f"Scheduled async function {func.__name__} to run at {execution_time} (priority={priority.value}, job_id={scheduled_job_id})")
+        logger.debug(f"Scheduled async function {func.__name__} to run at {execution_time} (priority={priority.value}, job_id={scheduled_job_id})")
         return scheduled_job_id
 
+    async def schedule_bulk(
+        self,
+        jobs: List[JobSpec],
+        *,
+        conflict_resolution: ConflictResolution = ConflictResolution.IGNORE,
+        batch_size: int = 1000,
+    ) -> List[str]:
+        """
+        Schedule multiple jobs in a single bulk operation for improved performance.
+        
+        Args:
+            jobs: List of JobSpec instances defining the jobs to schedule
+            conflict_resolution: Strategy for ALL jobs (IGNORE recommended for bulk)
+            batch_size: Max jobs per database transaction (default 1000)
+            
+        Returns:
+            List of job IDs in same order as input. Jobs that failed to insert
+            will have None in their position.
+        """
+        if not jobs:
+            return []
+        
+        # Validate all functions are async and register them
+        for job in jobs:
+            if not inspect.iscoroutinefunction(job.func):
+                raise TypeError(f"Expected an async function, got {type(job.func)} for {job.func}")
+            self.task_map[job.func.__name__] = job.func
+        
+        all_job_ids: List[str] = []
+        
+        # Process in batches
+        for i in range(0, len(jobs), batch_size):
+            batch = jobs[i:i + batch_size]
+            batch_ids = await self._insert_jobs_bulk(batch, conflict_resolution)
+            all_job_ids.extend(batch_ids)
+        
+        logger.debug(f"Bulk scheduled {len(all_job_ids)} jobs")
+        return all_job_ids
+
+    async def _insert_jobs_bulk(
+        self,
+        jobs: List[JobSpec],
+        conflict_resolution: ConflictResolution
+    ) -> List[str]:
+        """Insert a batch of jobs using executemany for optimal performance."""
+        # Prepare records for bulk insert
+        records = []
+        for job in jobs:
+            task_data = json.dumps({
+                'args': job.args,
+                'kwargs': job.kwargs or {}
+            })
+            
+            # Determine effective misfire_grace_time
+            if job.misfire_grace_time is _JOBSPEC_UNSET:
+                effective_misfire = self.misfire_grace_time
+            else:
+                effective_misfire = job.misfire_grace_time
+            
+            records.append((
+                job.job_id,  # Can be None for auto-generation
+                job.func.__name__,
+                job.execution_time,
+                task_data,
+                job.priority.db_value,
+                job.max_retries,
+                effective_misfire
+            ))
+        
+        try:
+            async with self.db_pool.acquire() as conn:
+                if conflict_resolution == ConflictResolution.IGNORE:
+                    # Use ON CONFLICT DO NOTHING for idempotent bulk inserts
+                    result = await conn.fetch("""
+                        INSERT INTO scheduled_jobs 
+                            (job_id, job_name, execution_time, status, task_data, priority, max_retries, misfire_grace_time)
+                        SELECT 
+                            COALESCE(d.job_id, gen_random_uuid()::text),
+                            d.job_name,
+                            d.execution_time,
+                            'pending',
+                            d.task_data::jsonb,
+                            d.priority,
+                            d.max_retries,
+                            d.misfire_grace_time
+                        FROM unnest($1::text[], $2::text[], $3::timestamptz[], $4::text[], $5::int[], $6::int[], $7::int[]) 
+                            AS d(job_id, job_name, execution_time, task_data, priority, max_retries, misfire_grace_time)
+                        ON CONFLICT (job_id) DO NOTHING
+                        RETURNING job_id;
+                    """, 
+                        [r[0] for r in records],  # job_ids
+                        [r[1] for r in records],  # job_names
+                        [r[2] for r in records],  # execution_times
+                        [r[3] for r in records],  # task_data
+                        [r[4] for r in records],  # priorities
+                        [r[5] for r in records],  # max_retries
+                        [r[6] for r in records],  # misfire_grace_time
+                    )
+                    return [row['job_id'] for row in result]
+                    
+                elif conflict_resolution == ConflictResolution.REPLACE:
+                    # Use ON CONFLICT DO UPDATE for upsert behavior
+                    result = await conn.fetch("""
+                        INSERT INTO scheduled_jobs 
+                            (job_id, job_name, execution_time, status, task_data, priority, max_retries, misfire_grace_time)
+                        SELECT 
+                            COALESCE(d.job_id, gen_random_uuid()::text),
+                            d.job_name,
+                            d.execution_time,
+                            'pending',
+                            d.task_data::jsonb,
+                            d.priority,
+                            d.max_retries,
+                            d.misfire_grace_time
+                        FROM unnest($1::text[], $2::text[], $3::timestamptz[], $4::text[], $5::int[], $6::int[], $7::int[]) 
+                            AS d(job_id, job_name, execution_time, task_data, priority, max_retries, misfire_grace_time)
+                        ON CONFLICT (job_id) DO UPDATE SET
+                            job_name = EXCLUDED.job_name,
+                            execution_time = EXCLUDED.execution_time,
+                            task_data = EXCLUDED.task_data,
+                            priority = EXCLUDED.priority,
+                            max_retries = EXCLUDED.max_retries,
+                            misfire_grace_time = EXCLUDED.misfire_grace_time,
+                            status = CASE 
+                                WHEN scheduled_jobs.status IN ('completed', 'failed', 'cancelled', 'expired') THEN 'pending'
+                                ELSE scheduled_jobs.status
+                            END,
+                            retry_count = 0,
+                            error_message = NULL,
+                            worker_id = NULL,
+                            last_heartbeat = NULL,
+                            lease_until = NULL
+                        RETURNING job_id;
+                    """, 
+                        [r[0] for r in records],
+                        [r[1] for r in records],
+                        [r[2] for r in records],
+                        [r[3] for r in records],
+                        [r[4] for r in records],
+                        [r[5] for r in records],
+                        [r[6] for r in records],
+                    )
+                    return [row['job_id'] for row in result]
+                    
+                else:  # ConflictResolution.RAISE
+                    # Simple insert - will fail on duplicates
+                    result = await conn.fetch("""
+                        INSERT INTO scheduled_jobs 
+                            (job_id, job_name, execution_time, status, task_data, priority, max_retries, misfire_grace_time)
+                        SELECT 
+                            COALESCE(d.job_id, gen_random_uuid()::text),
+                            d.job_name,
+                            d.execution_time,
+                            'pending',
+                            d.task_data::jsonb,
+                            d.priority,
+                            d.max_retries,
+                            d.misfire_grace_time
+                        FROM unnest($1::text[], $2::text[], $3::timestamptz[], $4::text[], $5::int[], $6::int[], $7::int[]) 
+                            AS d(job_id, job_name, execution_time, task_data, priority, max_retries, misfire_grace_time)
+                        RETURNING job_id;
+                    """, 
+                        [r[0] for r in records],
+                        [r[1] for r in records],
+                        [r[2] for r in records],
+                        [r[3] for r in records],
+                        [r[4] for r in records],
+                        [r[5] for r in records],
+                        [r[6] for r in records],
+                    )
+                    return [row['job_id'] for row in result]
+                    
+        except Exception as e:
+            logger.error(f"Bulk insert failed: {e}")
+            raise
+
     async def listen_for_jobs(self):
-        """Listen for jobs with reliability and optimized bulk claiming"""
+        """Listen for jobs with bulk claiming"""
         
         startup_jitter = random.uniform(0, 1.0)
         await asyncio.sleep(startup_jitter)
         
-        logger.info(f"Starting job listener [worker={self.worker_id}]")
+        logger.debug(f"Starting job listener [worker={self.worker_id}]")
         
         while self.is_running and not self.is_shutting_down:
             try:
@@ -717,13 +622,13 @@ class Scheduler:
                     await asyncio.sleep(1.0)
                     continue
                 
-                max_claimable = min(available_slots, 5)  # Cap at 5 for reasonable batch size
+                max_claimable = min(available_slots, self.batch_claim_limit)
                 
                 # Claim jobs from database
                 ready_jobs = await self._claim_jobs(max_claimable)
                 
                 if ready_jobs:
-                    logger.info(f"Claimed {len(ready_jobs)} jobs [worker={self.worker_id}] (bulk claiming)")
+                    logger.debug(f"Claimed {len(ready_jobs)} jobs [worker={self.worker_id}] (bulk claiming)")
                     
                     # The semaphore will naturally limit concurrency
                     for job_row in ready_jobs:
@@ -752,21 +657,24 @@ class Scheduler:
             # Use a transaction for atomic job claiming
             async with self.db_pool.acquire() as conn:
                 async with conn.transaction():
-                    # Calculate expiration cutoff for misfire grace time
+                    # Expire old jobs that are past their misfire grace time
+                    # Per-job misfire_grace_time takes precedence over scheduler default
+                    # NULL misfire_grace_time = no expiration
                     current_time = datetime.datetime.now(UTC)
-                    expiration_cutoff = current_time - datetime.timedelta(seconds=self.misfire_grace_time)
                     
-                    # Expire old jobs that are past the misfire grace time
-                    expired_jobs = await conn.fetch("""
-                        UPDATE scheduled_jobs 
-                        SET status = 'expired', worker_id = $1
-                        WHERE status = 'pending' 
-                        AND execution_time < $2
-                        RETURNING job_id, job_name, execution_time;
-                    """, self.worker_id, expiration_cutoff)
-                    
-                    if expired_jobs:
-                        logger.warning(f"Expired {len(expired_jobs)} jobs past grace time")
+                    if self.misfire_grace_time is not None:
+                        # Only check for expired jobs if scheduler has a default grace time
+                        expired_jobs = await conn.fetch("""
+                            UPDATE scheduled_jobs 
+                            SET status = 'expired', worker_id = $1
+                            WHERE status = 'pending' 
+                            AND misfire_grace_time IS NOT NULL  -- Only expire jobs with explicit misfire_grace_time
+                            AND execution_time + INTERVAL '1 second' * misfire_grace_time < $2
+                            RETURNING job_id, job_name, execution_time, misfire_grace_time;
+                        """, self.worker_id, current_time)
+                        
+                        if expired_jobs:
+                            logger.warning(f"Expired {len(expired_jobs)} jobs past grace time")
                     
                     # Claim ready jobs atomically using CTE pattern (limited by available semaphore slots)
                     ready_jobs = await conn.fetch("""
@@ -839,7 +747,7 @@ class Scheduler:
                 await self._safe_mark_job_failed(job_id, error_msg)
                 return
             
-            logger.info(f"Executing job {job_id} ({job_name}) [priority={priority.value}] [worker={self.worker_id}]")
+            logger.debug(f"Executing job {job_id} ({job_name}) [priority={priority.value}] [worker={self.worker_id}]")
             
             # Execute the function with timeout protection
             args = task_data.get('args', ())
@@ -857,7 +765,7 @@ class Scheduler:
             # Atomically mark as completed
             success = await self._safe_mark_job_completed(job_id)
             if success:
-                logger.info(f"Job {job_id} completed successfully [worker={self.worker_id}]")
+                logger.debug(f"Job {job_id} completed successfully [worker={self.worker_id}]")
             else:
                 logger.warning(f"Job {job_id} completed but failed to update status - may be retried")
             
@@ -1041,10 +949,10 @@ class Scheduler:
             total_deleted += deleted_count
             
             if deleted_count > 0:
-                logger.info(f"Vacuum: deleted {deleted_count} {status} jobs")
+                logger.debug(f"Vacuum: deleted {deleted_count} {status} jobs")
         
         if total_deleted > 0:
-            logger.info(f"Vacuum completed: deleted {total_deleted} total jobs")
+            logger.debug(f"Vacuum completed: deleted {total_deleted} total jobs")
 
     async def _apply_vacuum_policy(self, status: str, policy: VacuumPolicy, safety_window: datetime.datetime) -> int:
         """Apply a specific vacuum policy and return count of deleted jobs"""
@@ -1122,7 +1030,7 @@ class Scheduler:
         except Exception as e:
             logger.error(f"Failed to record vacuum metrics: {e}")
 
-    async def schedule_job(self, job_name, execution_time, task_data, priority: JobPriority = JobPriority.NORMAL, max_retries: int = 0, job_id: Optional[str] = None, conflict_resolution: ConflictResolution = ConflictResolution.RAISE) -> str:
+    async def schedule_job(self, job_name, execution_time, task_data, priority: JobPriority = JobPriority.NORMAL, max_retries: int = 0, job_id: Optional[str] = None, conflict_resolution: ConflictResolution = ConflictResolution.RAISE, misfire_grace_time: Optional[int] = None) -> str:
         """
         Schedule a job by inserting it into the 'scheduled_jobs' table.
         
@@ -1134,7 +1042,9 @@ class Scheduler:
             max_retries: Maximum retry attempts for failed jobs
             job_id: Optional custom job ID (auto-generated if not provided)
             conflict_resolution: How to handle duplicate job_id (RAISE, IGNORE, REPLACE)
-            
+            misfire_grace_time: Per-job misfire grace time in seconds. 
+                              None = use scheduler default
+                              
         Returns:
             str: The job ID of the scheduled job
             
@@ -1142,6 +1052,9 @@ class Scheduler:
             ValueError: If the provided job_id already exists and conflict_resolution is RAISE
         """
         json_task_data = json.dumps(task_data)
+        
+        # misfire_grace_time is already resolved by schedule() method
+        # It can be None (no expiration) or int (grace time in seconds)
         
         if job_id is not None:
             # Check if job_id already exists first
@@ -1159,7 +1072,7 @@ class Scheduler:
                             f"Choose a different job_id or omit it for auto-generation."
                         )
                     elif conflict_resolution == ConflictResolution.IGNORE:
-                        logger.info(f"Job ID '{job_id}' already exists, ignoring new job (conflict_resolution=IGNORE)")
+                        logger.warning(f"Job ID '{job_id}' already exists, ignoring new job (conflict_resolution=IGNORE)")
                         return job_id
                     elif conflict_resolution == ConflictResolution.REPLACE:
                         # Replace/update the existing job
@@ -1170,6 +1083,7 @@ class Scheduler:
                                 task_data = $4::jsonb,
                                 priority = $5,
                                 max_retries = $6,
+                                misfire_grace_time = $7,
                                 status = CASE 
                                     WHEN status IN ('completed', 'failed', 'cancelled', 'expired') THEN 'pending'
                                     ELSE status
@@ -1181,17 +1095,17 @@ class Scheduler:
                                 lease_until = NULL
                             WHERE job_id = $1
                             RETURNING job_id;
-                        """, job_id, job_name, execution_time, json_task_data, priority.db_value, max_retries)
+                        """, job_id, job_name, execution_time, json_task_data, priority.db_value, max_retries, misfire_grace_time)
                         
-                        logger.info(f"Job ID '{job_id}' replaced with new parameters (conflict_resolution=REPLACE)")
+                        logger.debug(f"Job ID '{job_id}' replaced with new parameters (conflict_resolution=REPLACE)")
                         return result[0]['job_id']
                 
                 # Insert with custom job_id (now we know it's unique)
                 result = await self._execute_with_retry("""
-                    INSERT INTO scheduled_jobs (job_id, job_name, execution_time, status, task_data, priority, max_retries)
-                    VALUES ($1, $2, $3, 'pending', $4::jsonb, $5, $6)
+                    INSERT INTO scheduled_jobs (job_id, job_name, execution_time, status, task_data, priority, max_retries, misfire_grace_time)
+                    VALUES ($1, $2, $3, 'pending', $4::jsonb, $5, $6, $7)
                     RETURNING job_id;
-                """, job_id, job_name, execution_time, json_task_data, priority.db_value, max_retries)
+                """, job_id, job_name, execution_time, json_task_data, priority.db_value, max_retries, misfire_grace_time)
                 
             except ValueError:
                 # Re-raise our custom error
@@ -1207,20 +1121,20 @@ class Scheduler:
                     else:
                         # For IGNORE or REPLACE, try again (recursively call with same parameters)
                         logger.warning(f"Race condition detected for job_id '{job_id}', retrying with conflict_resolution={conflict_resolution.value}")
-                        return await self.schedule_job(job_name, execution_time, task_data, priority, max_retries, job_id, conflict_resolution)
+                        return await self.schedule_job(job_name, execution_time, task_data, priority, max_retries, job_id, conflict_resolution, misfire_grace_time)
                 else:
                     # Re-raise unexpected errors
                     raise
         else:
             # Let database auto-generate job_id
             result = await self._execute_with_retry("""
-                INSERT INTO scheduled_jobs (job_name, execution_time, status, task_data, priority, max_retries)
-                VALUES ($1, $2, 'pending', $3::jsonb, $4, $5)
+                INSERT INTO scheduled_jobs (job_name, execution_time, status, task_data, priority, max_retries, misfire_grace_time)
+                VALUES ($1, $2, 'pending', $3::jsonb, $4, $5, $6)
                 RETURNING job_id;
-            """, job_name, execution_time, json_task_data, priority.db_value, max_retries)
+            """, job_name, execution_time, json_task_data, priority.db_value, max_retries, misfire_grace_time)
         
         scheduled_job_id = result[0]['job_id']
-        logger.info(f"Job scheduled: {job_name} at {execution_time} (priority={priority.value}, job_id={scheduled_job_id})")
+        logger.debug(f"Job scheduled: {job_name} at {execution_time} (priority={priority.value}, job_id={scheduled_job_id})")
         return scheduled_job_id
 
     async def cancel_job(self, job_id: str) -> bool:
@@ -1247,7 +1161,7 @@ class Scheduler:
             
             if result:
                 cancelled_job = result[0]
-                logger.info(f"Job cancelled: {cancelled_job['job_name']} (job_id={job_id})")
+                logger.debug(f"Job cancelled: {cancelled_job['job_name']} (job_id={job_id})")
                 
                 # Remove from active jobs if it was running
                 self.active_jobs.discard(job_id)
@@ -1300,11 +1214,11 @@ class Scheduler:
             results[status] = deleted_count
             
             if deleted_count > 0:
-                logger.info(f"Manual vacuum: deleted {deleted_count} {status} jobs")
+                logger.debug(f"Manual vacuum: deleted {deleted_count} {status} jobs")
         
         total = sum(results.values())
         if total > 0:
-            logger.info(f"Manual vacuum completed: deleted {total} total jobs")
+            logger.debug(f"Manual vacuum completed: deleted {total} total jobs")
         
         return results
 
@@ -1373,7 +1287,7 @@ class Scheduler:
         jobs = _periodic_registry.get_jobs()
         if dedup_key in jobs:
             jobs[dedup_key].enabled = True
-            logger.info(f"Enabled periodic job with dedup_key: {dedup_key}")
+            logger.debug(f"Enabled periodic job with dedup_key: {dedup_key}")
             return True
         return False
     
@@ -1382,7 +1296,7 @@ class Scheduler:
         jobs = _periodic_registry.get_jobs()
         if dedup_key in jobs:
             jobs[dedup_key].enabled = False
-            logger.info(f"Disabled periodic job with dedup_key: {dedup_key}")
+            logger.debug(f"Disabled periodic job with dedup_key: {dedup_key}")
             return True
         return False
     
@@ -1406,7 +1320,7 @@ class Scheduler:
                 conflict_resolution=ConflictResolution.REPLACE
             )
             
-            logger.info(f"Manually triggered periodic job {config.job_name}: {job_id}")
+            logger.debug(f"Manually triggered periodic job {config.job_name}: {job_id}")
             return job_id
             
         except Exception as e:

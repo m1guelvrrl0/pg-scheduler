@@ -1,0 +1,136 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main, develop, "release/*" ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: scheduler
+          POSTGRES_PASSWORD: scheduler123
+          POSTGRES_DB: scheduler_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e .
+        pip install pytest pytest-asyncio pytest-cov pytest-timeout
+    
+    - name: Run tests
+      env:
+        DATABASE_URL: postgresql://scheduler:scheduler123@localhost:5432/scheduler_db
+        PGHOST: localhost
+        PGPORT: 5432
+        PGUSER: scheduler
+        PGPASSWORD: scheduler123
+        PGDATABASE: scheduler_db
+      run: |
+        pytest tests/ -v --cov=pg_scheduler --cov-report=xml --cov-report=term --timeout=30
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v4
+      with:
+        file: ./coverage.xml
+        fail_ci_if_error: false
+        token: ${{ secrets.CODECOV_TOKEN }}
+
+  test-docker:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Run tests in Docker Compose
+      run: |
+        docker compose -f docker-compose.test.yml up --build --abort-on-container-exit --exit-code-from test
+    
+    - name: Show logs on failure
+      if: failure()
+      run: |
+        docker compose -f docker-compose.test.yml logs
+
+  race-condition-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Run race condition tests
+      run: |
+        docker compose -f docker-compose.race-test.yml up --build --abort-on-container-exit --exit-code-from monitor
+    
+    - name: Show test results
+      if: always()
+      run: |
+        echo "=== Monitor Results ==="
+        docker compose -f docker-compose.race-test.yml logs monitor
+    
+    - name: Show scheduler logs on failure
+      if: failure()
+      run: |
+        echo "=== Scheduler Instance Logs ==="
+        docker compose -f docker-compose.race-test.yml logs scheduler-1 scheduler-2 scheduler-3 scheduler-4
+    
+    - name: Cleanup
+      if: always()
+      run: |
+        docker compose -f docker-compose.race-test.yml down -v
+
+  lint:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    
+    - name: Install linting tools
+      run: |
+        python -m pip install --upgrade pip
+        pip install ruff black isort mypy
+    
+    - name: Run ruff
+      run: ruff check pg_scheduler/ tests/
+      continue-on-error: true
+    
+    - name: Check formatting with black
+      run: black --check pg_scheduler/ tests/
+      continue-on-error: true
+    
+    - name: Check import sorting
+      run: isort --check-only pg_scheduler/ tests/
+      continue-on-error: true
+

@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "pg-scheduler"
 version = "0.1.0"
 description = "A PostgreSQL-based async job scheduler with deduplication, periodic jobs, and reliability features"
-readme = "README.md"
+readme = "readme.MD"
 requires-python = ">=3.9"
 license = {file = "LICENSE"}
 authors = [
@@ -43,16 +43,25 @@ classifiers = [
 ]
 dependencies = [
     "asyncpg>=0.25.0",
+    "croniter>=3.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0",
+    "pytest-timeout>=2.1",
     "black>=22.0",
     "isort>=5.0",
     "mypy>=1.0",
-    "flake8>=5.0",
+    "ruff>=0.1.0",
+]
+test = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0",
+    "pytest-timeout>=2.1",
 ]
 examples = [
     "fastapi>=0.68.0",
