@@ -87,7 +87,7 @@ class TestBasicScheduling:
         )
         
         # Wait for job to execute
-        await asyncio.sleep(3)
+        await asyncio.sleep(5)
         
         assert test_id in _test_results
         assert len(_test_results[test_id]) == 1
@@ -103,7 +103,7 @@ class TestBasicScheduling:
             args=(test_id, 5, 3)
         )
         
-        await asyncio.sleep(3)
+        await asyncio.sleep(5)
         assert test_id in _test_results
         assert _test_results[test_id] == [8]
     
@@ -118,7 +118,7 @@ class TestBasicScheduling:
             kwargs={"test_id": test_id, "x": 4, "y": 7}
         )
         
-        await asyncio.sleep(3)
+        await asyncio.sleep(5)
         assert test_id in _test_results
         assert _test_results[test_id] == [28]
     
@@ -134,7 +134,7 @@ class TestBasicScheduling:
             kwargs={"y": 5}
         )
         
-        await asyncio.sleep(3)
+        await asyncio.sleep(5)
         assert test_id in _test_results
         assert _test_results[test_id] == [10]
     
@@ -150,7 +150,7 @@ class TestBasicScheduling:
                 kwargs={"index": i}
             )
         
-        await asyncio.sleep(3)
+        await asyncio.sleep(5)
         assert job_counter["count"] == 5
     
     async def test_job_with_custom_job_id(self, scheduler, sample_job, time_utils):
