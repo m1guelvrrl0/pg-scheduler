@@ -38,22 +38,22 @@ async def verify_periodic_deduplication(pool: asyncpg.Pool):
     # Count periodic_dedup executions per 5-second window
     results = await pool.fetch("""
         SELECT 
-            EXTRACT(EPOCH FROM timestamp)::BIGINT / 5 AS window,
+            EXTRACT(EPOCH FROM timestamp)::BIGINT / 5 AS time_window,
             COUNT(*) as executions,
             array_agg(instance_id) as instances
         FROM test_counters
         WHERE counter_name = 'periodic_dedup'
-        GROUP BY window
-        ORDER BY window
+        GROUP BY time_window
+        ORDER BY time_window
     """)
     
     success = True
     for row in results:
-        window = row['window']
+        tw = row['time_window']
         executions = row['executions']
         instances = row['instances']
         
-        print(f"  Window {window}: {executions} execution(s) by {instances}")
+        print(f"  Window {tw}: {executions} execution(s) by {instances}")
         
         if executions > 1:
             print(f"    ❌ FAIL: Periodic job executed {executions} times in same window!")
