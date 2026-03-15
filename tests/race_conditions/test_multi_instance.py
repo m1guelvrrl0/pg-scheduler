@@ -143,16 +143,20 @@ async def schedule_test_jobs(scheduler: Scheduler):
             priority_job,
             execution_time=execution_time,
             args=(name, instance_id),
-            priority=priority
+            priority=priority,
+            job_id=f"priority-{name}",
+            conflict_resolution=ConflictResolution.IGNORE
         )
     logger.info("✅ Scheduled priority jobs")
     
-    # Test 3: Schedule many concurrent jobs
+    # Test 3: Schedule many concurrent jobs (dedup across instances)
     for i in range(10):
         await scheduler.schedule(
             concurrent_job,
             execution_time=now + timedelta(seconds=30),
-            args=(i, instance_id)
+            args=(i, instance_id),
+            job_id=f"concurrent-{i}",
+            conflict_resolution=ConflictResolution.IGNORE
         )
     logger.info("✅ Scheduled 10 concurrent jobs")
     
