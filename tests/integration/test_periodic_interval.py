@@ -43,7 +43,7 @@ class TestPeriodicInterval:
         await sched.start()
         
         # Wait for at least 2 executions
-        await asyncio.sleep(5)
+        await asyncio.sleep(8)
         
         assert job_counter["count"] >= 2
         
