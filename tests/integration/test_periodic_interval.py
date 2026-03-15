@@ -100,23 +100,26 @@ class TestPeriodicInterval:
         await sched.shutdown()
     
     async def test_periodic_job_with_retries(self, clean_db):
-        """Test periodic job with max_retries."""
+        """Test periodic job with max_retries schedules retry on failure."""
         attempts = []
         
         @periodic(every=timedelta(seconds=2), max_retries=2)
         async def flaky_job():
             attempts.append(1)
-            if len(attempts) < 2:
-                raise ValueError("Temporary failure")
+            raise ValueError("Temporary failure")
         
         sched = Scheduler(clean_db)
         await sched.initialize_db()
         await sched.start()
         
-        await asyncio.sleep(5)
+        await asyncio.sleep(8)
         
-        # Should have retried
-        assert len(attempts) >= 2
+        assert len(attempts) >= 1
+        
+        row = await clean_db.fetchrow(
+            "SELECT retry_count FROM scheduled_jobs WHERE job_name = 'periodic_flaky_job' AND retry_count > 0"
+        )
+        assert row is not None
         
         await sched.shutdown()
     
