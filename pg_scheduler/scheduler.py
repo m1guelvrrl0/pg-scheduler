@@ -662,19 +662,17 @@ class Scheduler:
                     # NULL misfire_grace_time = no expiration
                     current_time = datetime.datetime.now(UTC)
                     
-                    if self.misfire_grace_time is not None:
-                        # Only check for expired jobs if scheduler has a default grace time
-                        expired_jobs = await conn.fetch("""
-                            UPDATE scheduled_jobs 
-                            SET status = 'expired', worker_id = $1
-                            WHERE status = 'pending' 
-                            AND misfire_grace_time IS NOT NULL  -- Only expire jobs with explicit misfire_grace_time
-                            AND execution_time + INTERVAL '1 second' * misfire_grace_time < $2
-                            RETURNING job_id, job_name, execution_time, misfire_grace_time;
-                        """, self.worker_id, current_time)
-                        
-                        if expired_jobs:
-                            logger.warning(f"Expired {len(expired_jobs)} jobs past grace time")
+                    expired_jobs = await conn.fetch("""
+                        UPDATE scheduled_jobs 
+                        SET status = 'expired', worker_id = $1
+                        WHERE status = 'pending' 
+                        AND COALESCE(misfire_grace_time, $3) IS NOT NULL
+                        AND execution_time + INTERVAL '1 second' * COALESCE(misfire_grace_time, $3) < $2
+                        RETURNING job_id, job_name, execution_time, misfire_grace_time;
+                    """, self.worker_id, current_time, self.misfire_grace_time)
+                    
+                    if expired_jobs:
+                        logger.warning(f"Expired {len(expired_jobs)} jobs past grace time")
                     
                     # Claim ready jobs atomically using CTE pattern (limited by available semaphore slots)
                     ready_jobs = await conn.fetch("""
@@ -1334,14 +1332,19 @@ class Scheduler:
             return None
         
         config = jobs[dedup_key]
-        return {
+        status: Dict[str, Any] = {
             "job_name": config.job_name,
-            "interval": config.interval.total_seconds(),
             "enabled": config.enabled,
             "priority": config.priority.value,
             "max_retries": config.max_retries,
             "dedup_key": config.dedup_key,
             "use_advisory_lock": config.use_advisory_lock,
             "function_name": config.func.__name__,
-            "function_module": config.func.__module__
+            "function_module": config.func.__module__,
         }
+        if config.interval is not None:
+            status["interval"] = config.interval.total_seconds()
+        if config.cron is not None:
+            status["cron"] = config.cron
+            status["timezone"] = str(config.timezone) if config.timezone else "UTC"
+        return status
