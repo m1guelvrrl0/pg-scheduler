@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-02-02
 
 ### Added
 - **Bulk job scheduling**: New `schedule_bulk()` method for high-performance batch inserts
@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Configurable `batch_size` parameter for chunking large batches (default: 1000)
   - Conflict resolution support (IGNORE, REPLACE, RAISE) applied to entire batch
 - **Configurable batch claiming**: New `batch_claim_limit` parameter in `Scheduler.__init__` to control max jobs claimed per batch (default: 10)
-- **🎉 Cron-based scheduling**: Full support for cron expressions in `@periodic` decorator
+- **Cron-based scheduling**: Full support for cron expressions in `@periodic` decorator
   - Use `cron` parameter instead of `every` (e.g., `cron="0 0 * * *"` for daily at midnight)
   - Supports all standard cron syntax: `*/15 * * * *`, `0 9-17 * * MON-FRI`, etc.
   - Requires `croniter>=3.0.0` dependency
