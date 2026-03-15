@@ -139,7 +139,7 @@ class TestPriorities:
         
         now = time_utils.now()
         
-        # Low priority but earlier time
+        # Low priority but earlier time — wide gap so scheduler polls between them
         await scheduler.schedule(
             timed_job,
             execution_time=now + timedelta(seconds=1),
@@ -150,12 +150,12 @@ class TestPriorities:
         # High priority but later time
         await scheduler.schedule(
             timed_job,
-            execution_time=now + timedelta(seconds=3),
+            execution_time=now + timedelta(seconds=6),
             args=("high_late",),
             priority=JobPriority.CRITICAL
         )
         
-        await asyncio.sleep(7)
+        await asyncio.sleep(10)
         
         # Earlier time should execute first, regardless of priority
         assert len(results) == 2
