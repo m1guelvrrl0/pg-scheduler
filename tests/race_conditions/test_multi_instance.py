@@ -97,17 +97,25 @@ async def get_db_pool():
 
 
 async def setup_test_tables(pool: asyncpg.Pool):
-    """Create test counter table."""
-    await pool.execute("""
-        CREATE TABLE IF NOT EXISTS test_counters (
-            id SERIAL PRIMARY KEY,
-            counter_name TEXT NOT NULL,
-            instance_id TEXT NOT NULL,
-            count INTEGER NOT NULL,
-            timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    """)
-    logger.info("✅ Test tables created")
+    """Create test counter table with retry for concurrent CREATE TABLE race."""
+    for attempt in range(5):
+        try:
+            await pool.execute("""
+                CREATE TABLE IF NOT EXISTS test_counters (
+                    id SERIAL PRIMARY KEY,
+                    counter_name TEXT NOT NULL,
+                    instance_id TEXT NOT NULL,
+                    count INTEGER NOT NULL,
+                    timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            logger.info("✅ Test tables created")
+            return
+        except Exception as e:
+            if attempt < 4:
+                await asyncio.sleep(0.5 * (attempt + 1))
+            else:
+                raise
 
 
 async def schedule_test_jobs(scheduler: Scheduler):
