@@ -148,12 +148,9 @@ class TestTimezoneSupport:
         
         await sched.shutdown()
     
+    @pytest.mark.timeout(90)
     async def test_timezone_execution_time_conversion(self, clean_db, job_counter):
         """Test that timezone-aware jobs execute at correct UTC time."""
-        # This test would need to verify that a job scheduled for, say,
-        # 9am New York time actually executes at the correct UTC time.
-        # This is complex to test without waiting for actual time to pass.
-        
         @periodic(cron="* * * * *", timezone="America/New_York")
         async def ny_job():
             await job_counter["job"](time=datetime.now(UTC))
@@ -164,10 +161,8 @@ class TestTimezoneSupport:
         
         await asyncio.sleep(75)
         
-        # Job should have executed
         assert job_counter["count"] >= 1
         
-        # All execution times should be in UTC
         for execution in job_counter["executions"]:
             exec_time = execution["kwargs"]["time"]
             assert exec_time.tzinfo == UTC

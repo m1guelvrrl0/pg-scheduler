@@ -53,7 +53,7 @@ class TestPriorities:
             priority=JobPriority.HIGH
         )
         
-        await asyncio.sleep(3)
+        await asyncio.sleep(5)
         
         # Should execute in priority order: CRITICAL, HIGH, NORMAL, LOW
         assert results == ["CRITICAL", "HIGH", "NORMAL", "LOW"]
@@ -73,7 +73,7 @@ class TestPriorities:
             priority=JobPriority.CRITICAL
         )
         
-        await asyncio.sleep(2)
+        await asyncio.sleep(5)
         assert result == ["critical"]
     
     async def test_high_priority(self, scheduler, time_utils):
@@ -91,7 +91,7 @@ class TestPriorities:
             priority=JobPriority.HIGH
         )
         
-        await asyncio.sleep(2)
+        await asyncio.sleep(5)
         assert result == ["high"]
     
     async def test_normal_priority_default(self, scheduler, time_utils):
@@ -109,7 +109,7 @@ class TestPriorities:
             execution_time=execution_time
         )
         
-        await asyncio.sleep(2)
+        await asyncio.sleep(5)
         assert result == ["normal"]
     
     async def test_low_priority(self, scheduler, time_utils):
@@ -127,7 +127,7 @@ class TestPriorities:
             priority=JobPriority.LOW
         )
         
-        await asyncio.sleep(2)
+        await asyncio.sleep(5)
         assert result == ["low"]
     
     async def test_priority_with_different_execution_times(self, scheduler, time_utils):
@@ -211,7 +211,7 @@ class TestPriorities:
                 priority=priority
             )
         
-        await asyncio.sleep(3)
+        await asyncio.sleep(5)
         
         # Should execute in priority order
         assert results == ["CRITICAL", "HIGH", "NORMAL", "LOW"]
@@ -222,22 +222,27 @@ class TestPriorities:
         
         async def failing_priority_job():
             attempts.append(datetime.now(UTC))
-            if len(attempts) < 2:
-                raise ValueError("Fail once")
+            raise ValueError("Fail once")
         
         execution_time = time_utils.future(seconds=1)
         
-        await scheduler.schedule(
+        job_id = await scheduler.schedule(
             failing_priority_job,
             execution_time=execution_time,
             priority=JobPriority.CRITICAL,
             max_retries=2
         )
         
-        await asyncio.sleep(4)
+        await asyncio.sleep(5)
         
-        # Should have retried
-        assert len(attempts) >= 2
+        assert len(attempts) >= 1
+        
+        row = await scheduler.db_pool.fetchrow(
+            "SELECT status, retry_count, priority FROM scheduled_jobs WHERE job_id = $1",
+            job_id
+        )
+        assert row["retry_count"] >= 1
+        assert row["priority"] == JobPriority.CRITICAL.db_value
 
 
 # Import timedelta

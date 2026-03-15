@@ -180,12 +180,12 @@ class TestPeriodicInterval:
         await sched.initialize_db()
         await sched.start()
         
-        await asyncio.sleep(7)
+        await asyncio.sleep(12)
         
         # job1 should run most frequently
         assert counters["job1"] >= 5
-        assert counters["job2"] >= 2
-        assert counters["job3"] >= 1
+        assert counters["job2"] >= 3
+        assert counters["job3"] >= 2
         
         await sched.shutdown()
     

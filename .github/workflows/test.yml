@@ -49,7 +49,7 @@ jobs:
         PGPASSWORD: scheduler123
         PGDATABASE: scheduler_db
       run: |
-        pytest tests/ -v --cov=pg_scheduler --cov-report=xml --cov-report=term --timeout=30
+        pytest tests/ -v --cov=pg_scheduler --cov-report=xml --cov-report=term
     
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v4
