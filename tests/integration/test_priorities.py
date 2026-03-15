@@ -155,9 +155,10 @@ class TestPriorities:
             priority=JobPriority.CRITICAL
         )
         
-        await asyncio.sleep(4)
+        await asyncio.sleep(7)
         
         # Earlier time should execute first, regardless of priority
+        assert len(results) == 2
         assert results[0] == "low_early"
         assert results[1] == "high_late"
     

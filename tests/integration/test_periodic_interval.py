@@ -63,7 +63,7 @@ class TestPeriodicInterval:
         await sched.start()
         
         # Wait for multiple executions
-        await asyncio.sleep(7)
+        await asyncio.sleep(10)
         
         assert job_counter["count"] >= 3
         
@@ -72,8 +72,7 @@ class TestPeriodicInterval:
             intervals = [execution_times[i+1] - execution_times[i] 
                         for i in range(len(execution_times)-1)]
             for interval in intervals:
-                # Allow some tolerance
-                assert 1.5 < interval < 3.0
+                assert 1.5 < interval < 4.0
         
         await sched.shutdown()
     

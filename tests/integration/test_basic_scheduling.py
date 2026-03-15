@@ -261,7 +261,7 @@ class TestBasicScheduling:
         await scheduler.schedule(ordered_job, execution_time=now + timedelta(seconds=1), args=(1,))
         await scheduler.schedule(ordered_job, execution_time=now + timedelta(seconds=2), args=(2,))
         
-        await asyncio.sleep(4)
+        await asyncio.sleep(7)
         
         # Should execute in time order, not schedule order
         assert results == [1, 2, 3]
