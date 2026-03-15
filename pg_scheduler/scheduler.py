@@ -666,10 +666,10 @@ class Scheduler:
                         UPDATE scheduled_jobs 
                         SET status = 'expired', worker_id = $1
                         WHERE status = 'pending' 
-                        AND COALESCE(misfire_grace_time, $3) IS NOT NULL
-                        AND execution_time + INTERVAL '1 second' * COALESCE(misfire_grace_time, $3) < $2
+                        AND misfire_grace_time IS NOT NULL
+                        AND execution_time + INTERVAL '1 second' * misfire_grace_time < $2
                         RETURNING job_id, job_name, execution_time, misfire_grace_time;
-                    """, self.worker_id, current_time, self.misfire_grace_time)
+                    """, self.worker_id, current_time)
                     
                     if expired_jobs:
                         logger.warning(f"Expired {len(expired_jobs)} jobs past grace time")
