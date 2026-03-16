@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Per-job misfire_grace_time ignored when scheduler default is None**: The job expiration logic was entirely skipped when the scheduler's `misfire_grace_time` was set to `None`, causing jobs with explicit per-job `misfire_grace_time` to never expire. The query now uses `COALESCE` to correctly fall back from per-job to scheduler-default grace time, and always runs regardless of the scheduler default.
+- **Per-job misfire_grace_time ignored when scheduler default is None**: The job expiration logic was entirely skipped when the scheduler's `misfire_grace_time` was set to `None`, causing jobs with explicit per-job `misfire_grace_time` to never expire. Removed the Python-side guard so the SQL query now always runs and relies on `misfire_grace_time IS NOT NULL` to correctly expire only jobs with an explicit grace time.
 - **get_periodic_job_status crashes for cron-based periodic jobs**: Calling `get_periodic_job_status` on a cron-based job raised `AttributeError` because it unconditionally accessed `config.interval.total_seconds()`. Now correctly handles both interval-based and cron-based jobs, returning `interval` or `cron`/`timezone` fields as appropriate.
 
 ## [0.2.0] - 2026-02-02
@@ -105,6 +105,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Architecture**: Async/await throughout for maximum performance
 - **Database Schema**: Optimized table structure with proper indexing
 
-[0.2.1]: https://github.com/miguelrebelo/pg-scheduler/releases/tag/v0.2.1
-[0.2.0]: https://github.com/miguelrebelo/pg-scheduler/releases/tag/v0.2.0
-[0.1.0]: https://github.com/miguelrebelo/pg-scheduler/releases/tag/v0.1.0
+[0.2.1]: https://github.com/m1guelvrrl0/pg-scheduler/releases/tag/v0.2.1
+[0.2.0]: https://github.com/m1guelvrrl0/pg-scheduler/releases/tag/v0.2.0
+[0.1.0]: https://github.com/m1guelvrrl0/pg-scheduler/releases/tag/v0.1.0
