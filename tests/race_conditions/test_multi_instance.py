@@ -97,17 +97,25 @@ async def get_db_pool():
 
 
 async def setup_test_tables(pool: asyncpg.Pool):
-    """Create test counter table."""
-    await pool.execute("""
-        CREATE TABLE IF NOT EXISTS test_counters (
-            id SERIAL PRIMARY KEY,
-            counter_name TEXT NOT NULL,
-            instance_id TEXT NOT NULL,
-            count INTEGER NOT NULL,
-            timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    """)
-    logger.info("✅ Test tables created")
+    """Create test counter table with retry for concurrent CREATE TABLE race."""
+    for attempt in range(5):
+        try:
+            await pool.execute("""
+                CREATE TABLE IF NOT EXISTS test_counters (
+                    id SERIAL PRIMARY KEY,
+                    counter_name TEXT NOT NULL,
+                    instance_id TEXT NOT NULL,
+                    count INTEGER NOT NULL,
+                    timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            logger.info("✅ Test tables created")
+            return
+        except Exception as e:
+            if attempt < 4:
+                await asyncio.sleep(0.5 * (attempt + 1))
+            else:
+                raise
 
 
 async def schedule_test_jobs(scheduler: Scheduler):
@@ -143,16 +151,20 @@ async def schedule_test_jobs(scheduler: Scheduler):
             priority_job,
             execution_time=execution_time,
             args=(name, instance_id),
-            priority=priority
+            priority=priority,
+            job_id=f"priority-{name}",
+            conflict_resolution=ConflictResolution.IGNORE
         )
     logger.info("✅ Scheduled priority jobs")
     
-    # Test 3: Schedule many concurrent jobs
+    # Test 3: Schedule many concurrent jobs (dedup across instances)
     for i in range(10):
         await scheduler.schedule(
             concurrent_job,
             execution_time=now + timedelta(seconds=30),
-            args=(i, instance_id)
+            args=(i, instance_id),
+            job_id=f"concurrent-{i}",
+            conflict_resolution=ConflictResolution.IGNORE
         )
     logger.info("✅ Scheduled 10 concurrent jobs")
     

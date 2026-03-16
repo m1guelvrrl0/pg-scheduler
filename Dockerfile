@@ -8,11 +8,8 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Install dependencies
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-
-# Copy the application code
+# Copy and install the package (editable so volume mounts work at runtime)
 COPY . .
+RUN pip install -e .
 
-CMD ["python", "example.py"] 
+CMD ["python", "example.py"]

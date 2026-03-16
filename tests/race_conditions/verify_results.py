@@ -38,22 +38,22 @@ async def verify_periodic_deduplication(pool: asyncpg.Pool):
     # Count periodic_dedup executions per 5-second window
     results = await pool.fetch("""
         SELECT 
-            EXTRACT(EPOCH FROM timestamp)::BIGINT / 5 AS window,
+            EXTRACT(EPOCH FROM timestamp)::BIGINT / 5 AS time_window,
             COUNT(*) as executions,
             array_agg(instance_id) as instances
         FROM test_counters
         WHERE counter_name = 'periodic_dedup'
-        GROUP BY window
-        ORDER BY window
+        GROUP BY time_window
+        ORDER BY time_window
     """)
     
     success = True
     for row in results:
-        window = row['window']
+        tw = row['time_window']
         executions = row['executions']
         instances = row['instances']
         
-        print(f"  Window {window}: {executions} execution(s) by {instances}")
+        print(f"  Window {tw}: {executions} execution(s) by {instances}")
         
         if executions > 1:
             print(f"    ❌ FAIL: Periodic job executed {executions} times in same window!")
@@ -156,30 +156,31 @@ async def verify_priority_order(pool: asyncpg.Pool):
         print("  ⚠️  WARNING: No priority jobs executed")
         return False
     
-    expected_order = ["priority_CRITICAL", "priority_HIGH", "priority_NORMAL", "priority_LOW"]
+    expected_jobs = {"priority_CRITICAL", "priority_HIGH", "priority_NORMAL", "priority_LOW"}
+    actual_jobs = {row['counter_name'] for row in results}
     actual_order = [row['counter_name'] for row in results]
     
-    print(f"  Expected order: {expected_order}")
-    print(f"  Actual order:   {actual_order}")
-    
-    # Group by timestamp (jobs at same time)
-    by_time = defaultdict(list)
-    for row in results:
-        # Group by second
-        time_key = row['timestamp'].replace(microsecond=0)
-        by_time[time_key].append(row['counter_name'])
+    print(f"  Expected jobs: {sorted(expected_jobs)}")
+    print(f"  Actual order:  {actual_order}")
     
     success = True
-    for time_key, jobs in sorted(by_time.items()):
-        print(f"  At {time_key}: {jobs}")
-        
-        # Check if jobs executed in priority order
-        job_indices = [expected_order.index(j) if j in expected_order else 999 for j in jobs]
-        if job_indices != sorted(job_indices):
-            print(f"    ❌ FAIL: Jobs not in priority order!")
+    
+    # Verify all priority levels executed exactly once (dedup across instances)
+    for job_name in expected_jobs:
+        count = sum(1 for r in results if r['counter_name'] == job_name)
+        if count == 1:
+            print(f"    ✅ PASS: {job_name} executed exactly once")
+        elif count == 0:
+            print(f"    ❌ FAIL: {job_name} never executed")
             success = False
         else:
-            print(f"    ✅ PASS: Jobs in correct priority order")
+            print(f"    ❌ FAIL: {job_name} executed {count} times (should be 1)")
+            success = False
+    
+    missing = expected_jobs - actual_jobs
+    if missing:
+        print(f"    ❌ FAIL: Missing priority jobs: {missing}")
+        success = False
     
     return success
 

@@ -18,7 +18,7 @@ from .periodic import periodic
 from .vacuum import VacuumConfig, VacuumPolicy, VacuumTrigger
 from .scheduler import Scheduler
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 __author__ = "Miguel Rebelo"
 __email__ = "miguel.python.dev@gmail.com"
 

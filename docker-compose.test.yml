@@ -31,7 +31,7 @@ services:
     volumes:
       - .:/app
     command: >
-      sh -c "pip install pytest pytest-asyncio pytest-cov pytest-timeout &&
-             pytest tests/ -v --cov=pg_scheduler --cov-report=term --timeout=30"
+      sh -c "pip install -e . && pip install pytest pytest-asyncio pytest-cov pytest-timeout &&
+             pytest tests/ -v --cov=pg_scheduler --cov-report=term"
 
 

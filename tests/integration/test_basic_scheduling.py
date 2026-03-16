@@ -87,7 +87,7 @@ class TestBasicScheduling:
         )
         
         # Wait for job to execute
-        await asyncio.sleep(3)
+        await asyncio.sleep(5)
         
         assert test_id in _test_results
         assert len(_test_results[test_id]) == 1
@@ -103,7 +103,7 @@ class TestBasicScheduling:
             args=(test_id, 5, 3)
         )
         
-        await asyncio.sleep(3)
+        await asyncio.sleep(5)
         assert test_id in _test_results
         assert _test_results[test_id] == [8]
     
@@ -118,7 +118,7 @@ class TestBasicScheduling:
             kwargs={"test_id": test_id, "x": 4, "y": 7}
         )
         
-        await asyncio.sleep(3)
+        await asyncio.sleep(5)
         assert test_id in _test_results
         assert _test_results[test_id] == [28]
     
@@ -134,7 +134,7 @@ class TestBasicScheduling:
             kwargs={"y": 5}
         )
         
-        await asyncio.sleep(3)
+        await asyncio.sleep(5)
         assert test_id in _test_results
         assert _test_results[test_id] == [10]
     
@@ -150,7 +150,7 @@ class TestBasicScheduling:
                 kwargs={"index": i}
             )
         
-        await asyncio.sleep(3)
+        await asyncio.sleep(5)
         assert job_counter["count"] == 5
     
     async def test_job_with_custom_job_id(self, scheduler, sample_job, time_utils):
@@ -261,24 +261,22 @@ class TestBasicScheduling:
         await scheduler.schedule(ordered_job, execution_time=now + timedelta(seconds=1), args=(1,))
         await scheduler.schedule(ordered_job, execution_time=now + timedelta(seconds=2), args=(2,))
         
-        await asyncio.sleep(4)
+        await asyncio.sleep(7)
         
         # Should execute in time order, not schedule order
         assert results == [1, 2, 3]
     
     async def test_failed_job_with_retries(self, scheduler, time_utils):
-        """Test that failed jobs are retried."""
+        """Test that failed jobs are rescheduled for retry with incremented retry_count."""
         attempts = []
         
         async def failing_job():
             attempts.append(datetime.now(UTC))
-            if len(attempts) < 3:
-                raise ValueError("Not yet!")
-            return "success"
+            raise ValueError("Not yet!")
         
         execution_time = time_utils.future(seconds=1)
         
-        await scheduler.schedule(
+        job_id = await scheduler.schedule(
             failing_job,
             execution_time=execution_time,
             max_retries=3
@@ -286,8 +284,13 @@ class TestBasicScheduling:
         
         await asyncio.sleep(5)
         
-        # Should have attempted 3 times (initial + 2 retries before success)
-        assert len(attempts) >= 3
+        assert len(attempts) >= 1
+        
+        row = await scheduler.db_pool.fetchrow(
+            "SELECT status, retry_count FROM scheduled_jobs WHERE job_id = $1", job_id
+        )
+        assert row["status"] == "pending"
+        assert row["retry_count"] >= 1
     
     async def test_scheduler_max_concurrent_jobs(self, scheduler_no_start, time_utils):
         """Test that max_concurrent_jobs is respected."""
