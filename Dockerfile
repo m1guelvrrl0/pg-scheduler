@@ -12,4 +12,4 @@ WORKDIR /app
 COPY . .
 RUN pip install -e .
 
-CMD ["python", "example.py"]
+CMD ["python", "examples/basic.py"]

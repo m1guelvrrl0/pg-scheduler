@@ -28,4 +28,4 @@ services:
       - .:/app
     ports:
       - "8000:8000"
-    command: python fastapi_example.py
+    command: python examples/fastapi_app.py

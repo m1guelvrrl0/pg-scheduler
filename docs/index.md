@@ -1,129 +1,38 @@
-# PG Scheduler Documentation
+# PG Scheduler
 
-Welcome to PG Scheduler - a robust job scheduler built on PostgreSQL with async I/O support.
+A PostgreSQL-backed async job scheduler for Python. Jobs are stored as rows in a
+single table and claimed atomically with `FOR UPDATE SKIP LOCKED`, so there is no
+broker, no message queue, and no external dependency beyond Postgres itself.
 
 ```{toctree}
 :maxdepth: 2
-:caption: Contents:
+:caption: Contents
 
 quickstart
 user-guide/index
+performance
 api/index
 examples/index
-deployment
 changelog
 ```
 
-## Overview
+## Key Features
 
-PG Scheduler provides a comprehensive job scheduling solution with:
+- **Periodic jobs** -- `@periodic` decorator with interval or cron expressions, automatic rescheduling, and cross-replica deduplication.
+- **Bulk scheduling** -- `schedule_bulk()` inserts thousands of jobs in a single SQL statement using `unnest`.
+- **Priority queues** -- four levels (CRITICAL, HIGH, NORMAL, LOW) respected during claim ordering.
+- **Reliability** -- heartbeat monitoring, lease-based execution, orphan recovery, graceful shutdown, and retry with exponential backoff.
+- **Vacuum policies** -- configurable cleanup of completed, failed, and cancelled jobs.
+- **Multi-worker safe** -- run as many instances as you need; `FOR UPDATE SKIP LOCKED` prevents double-execution without any coordination layer.
 
-- **🔄 Periodic Jobs**: Simple `@periodic` decorator for recurring tasks
-- **🔒 Deduplication**: Guarantees exactly one execution per window across replicas  
-- **⚡ Self-Rescheduling**: Jobs automatically schedule their next execution
-- **🛡️ Advisory Locks**: Optional PostgreSQL advisory locks for exclusive execution
-- **🎯 Priority Queues**: Support for job priorities and retry logic
-- **🧹 Vacuum Policies**: Automatic cleanup of completed jobs
-- **💪 Reliability**: Graceful shutdown, error handling, and orphan recovery
+## How It Works
 
-## Quick Start
+1. You create an `asyncpg` connection pool and pass it to a `Scheduler`.
+2. The scheduler creates the `scheduled_jobs` table on first start (if it does not already exist).
+3. A polling loop claims pending rows, executes the associated async function, and marks the row completed or failed.
+4. Periodic jobs reschedule themselves after each execution using deterministic IDs for deduplication.
 
-### Installation
-
-```bash
-pip install pg-scheduler
-```
-
-### Basic Usage
-
-```python
-import asyncio
-import asyncpg
-from datetime import datetime, timedelta, UTC
-from pg_scheduler import Scheduler, periodic, JobPriority
-
-# Simple periodic job
-@periodic(every=timedelta(minutes=15))
-async def cleanup_temp_files():
-    print("🧹 Cleaning up temporary files...")
-    await asyncio.sleep(1)
-    print("✅ Cleanup completed")
-
-# Manual job scheduling
-async def send_email(recipient: str, subject: str):
-    print(f"📧 Sending email to {recipient}: {subject}")
-    await asyncio.sleep(1)
-    print(f"✅ Email sent")
-
-async def main():
-    # Create database connection
-    db_pool = await asyncpg.create_pool(
-        user='scheduler',
-        password='password',
-        database='scheduler_db',
-        host='localhost'
-    )
-    
-    # Initialize scheduler
-    scheduler = Scheduler(db_pool=db_pool)
-    await scheduler.start()
-    
-    try:
-        # Schedule a job
-        job_id = await scheduler.schedule(
-            send_email,
-            execution_time=datetime.now(UTC) + timedelta(minutes=5),
-            args=("user@example.com", "Welcome!"),
-            priority=JobPriority.NORMAL
-        )
-        
-        # Let it run
-        await asyncio.sleep(300)
-        
-    finally:
-        await scheduler.shutdown()
-        await db_pool.close()
-
-if __name__ == "__main__":
-    asyncio.run(main())
-```
-
-## Features
-
-### Periodic Jobs
-
-The `@periodic` decorator makes recurring jobs simple:
-
-```python
-from datetime import timedelta
-from pg_scheduler import periodic, JobPriority
-
-@periodic(every=timedelta(hours=1), priority=JobPriority.CRITICAL)
-async def generate_reports():
-    """Generate hourly reports"""
-    # Your code here
-    pass
-```
-
-### Reliability
-
-Built-in reliability features include:
-
-- **Cross-replica deduplication** - Same job won't run twice
-- **Heartbeat monitoring** - Detect crashed workers
-- **Orphan recovery** - Clean up abandoned jobs  
-- **Graceful shutdown** - Wait for jobs to complete
-- **Retry logic** - Automatic retry with exponential backoff
-
-### Project Overview Features
-
-- **PostgreSQL backend** - Reliable, ACID-compliant storage
-- **Async/await support** - Built for modern Python
-- **Docker friendly** - Easy containerization
-- **Monitoring** - Comprehensive logging and metrics
-- **Scalable** - Run multiple replicas safely
-
-## Indices and tables
+## Indices and Tables
 
 - {ref}`genindex`
 - {ref}`modindex`

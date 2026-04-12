@@ -183,15 +183,72 @@ vacuum_config = VacuumConfig(
 scheduler = Scheduler(db_pool, vacuum_config=vacuum_config)
 ```
 
+## FastAPI Integration
+
+```python
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+
+from fastapi import FastAPI
+from pg_scheduler import Scheduler, periodic
+import asyncpg
+import asyncio
+
+@periodic(every=timedelta(minutes=5))
+async def cleanup_stale_sessions():
+    await asyncio.sleep(0.5)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.db_pool = await asyncpg.create_pool(
+        host="localhost", port=5432,
+        user="scheduler", password="scheduler123",
+        database="scheduler_db",
+    )
+    app.state.scheduler = Scheduler(app.state.db_pool, max_concurrent_jobs=20)
+    await app.state.scheduler.start()
+    yield
+    await app.state.scheduler.shutdown()
+    await app.state.db_pool.close()
+
+app = FastAPI(lifespan=lifespan)
+
+async def send_email(recipient: str):
+    await asyncio.sleep(1)
+
+@app.post("/send-email")
+async def schedule_email(recipient: str):
+    await app.state.scheduler.schedule(
+        send_email,
+        execution_time=datetime.now() + timedelta(seconds=10),
+        args=(recipient,),
+    )
+    return {"status": "scheduled"}
+```
+
 ## Configuration
 
 ```python
+from pg_scheduler import Scheduler, PollingConfig, VacuumConfig, VacuumPolicy
+
 scheduler = Scheduler(
     db_pool=db_pool,
-    max_concurrent_jobs=25,      # Max concurrent job execution
+    max_concurrent_jobs=25,      # Concurrent job execution limit (default: 25)
+    batch_claim_limit=10,        # Jobs claimed per poll iteration (default: 10)
     misfire_grace_time=300,      # Seconds before pending jobs expire (None to disable)
-    vacuum_enabled=True,         # Enable automatic job cleanup
-    vacuum_config=vacuum_config  # Custom vacuum policies
+    polling_config=PollingConfig(
+        min_interval=0.05,       # Sleep after a successful claim
+        max_interval=2.0,        # Upper bound for idle backoff
+        idle_start_interval=0.5, # First idle sleep
+        backoff_multiplier=1.5,  # Idle backoff growth factor
+    ),
+    vacuum_enabled=True,
+    vacuum_config=VacuumConfig(
+        completed=VacuumPolicy.after_days(1),
+        failed=VacuumPolicy.after_days(7),
+        cancelled=VacuumPolicy.after_days(3),
+        interval_minutes=60,
+    ),
 )
 ```
 

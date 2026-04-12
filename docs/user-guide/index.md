@@ -1,54 +1,54 @@
 # User Guide
-IN-PROGRESS
-This comprehensive guide plans to cover all aspects of using PG Scheduler.
+
+This guide covers the configuration options and features of PG Scheduler in
+detail.
 
 ```{toctree}
 :maxdepth: 2
 
-basic-usage
-periodic-jobs
-reliability
-vacuum-policies
 configuration
-troubleshooting
 ```
-
-## Overview
-
-PG Scheduler is designed to be both simple for basic use cases and powerful for production deployments. This guide will walk you through:
-
-1. **Basic Usage** - Core concepts and simple job scheduling
-2. **Periodic Jobs** - Using the `@periodic` decorator effectively  
-3. **Reliability** - Understanding deduplication, retries, and error handling
-4. **Vacuum Policies** - Managing job lifecycle and cleanup
-5. **Configuration** - Tuning the scheduler for your needs
-6. **Troubleshooting** - Common issues and solutions
 
 ## Key Concepts
 
-### Jobs vs Periodic Jobs
+### Jobs vs. Periodic Jobs
 
-- **Jobs**: One-time executions scheduled for a specific time
-- **Periodic Jobs**: Recurring executions that reschedule themselves
+- **Jobs** are one-time executions scheduled for a specific `execution_time`.
+- **Periodic jobs** are recurring executions registered with the `@periodic`
+  decorator. After each run, the job reschedules itself for the next window.
 
 ### Deduplication
 
-PG Scheduler prevents duplicate job executions across multiple worker replicas using:
+PG Scheduler prevents duplicate job executions across multiple worker replicas
+using:
 
-- **Deterministic Job IDs**: Based on function signature and parameters
-- **Database Constraints**: PostgreSQL primary keys prevent duplicates
-- **Window-based Logic**: Time-based deduplication for periodic jobs
+- **Deterministic job IDs** based on function name and schedule parameters.
+- **Database constraints** -- PostgreSQL primary keys prevent duplicate rows.
+- **Window-based logic** -- periodic jobs generate time-window keys so the same
+  window is never scheduled twice.
 
 ### Priority System
 
-Jobs can have different priorities:
+Jobs are claimed in priority order (lower number = higher priority):
 
-- `JobPriority.CRITICAL` - Executes before normal jobs
-- `JobPriority.NORMAL` - Default priority
+| Level | Value | Description |
+|---|---|---|
+| `JobPriority.CRITICAL` | 1 | Claimed before all other jobs |
+| `JobPriority.HIGH` | 3 | High priority |
+| `JobPriority.NORMAL` | 5 | Default |
+| `JobPriority.LOW` | 8 | Claimed last |
+
+Within the same priority, jobs are ordered by `execution_time`.
 
 ### Reliability Features
 
-- **Heartbeat Monitoring**: Detect crashed workers
-- **Orphan Recovery**: Clean up abandoned jobs
-- **Graceful Shutdown**: Complete active jobs before stopping
-- **Retry Logic**: Automatic retry with exponential backoff
+- **Heartbeat monitoring** -- running jobs send a heartbeat every 30 seconds.
+  Workers that stop sending heartbeats have their jobs recovered.
+- **Lease-based execution** -- each claimed job gets a 60-second lease that is
+  renewed by heartbeats. Expired leases trigger recovery.
+- **Orphan recovery** -- on startup and periodically, the scheduler reclaims
+  jobs left in `running` state by dead workers.
+- **Graceful shutdown** -- active jobs are given up to 30 seconds to complete
+  before the process exits.
+- **Retry logic** -- failed jobs are retried with exponential backoff up to
+  `max_retries` times.

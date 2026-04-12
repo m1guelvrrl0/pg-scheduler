@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-03-30
+
+### Added
+- **Configurable polling backoff**: New `PollingConfig` dataclass for fine-grained control over job listener polling behavior
+  - `min_interval` — sleep between polls when jobs are being claimed (default: 0.05s)
+  - `max_interval` — upper bound for backoff when idle (default: 2.0s)
+  - `backoff_multiplier` — exponential backoff factor when no jobs are found (default: 1.5)
+  - `idle_start_interval` — initial idle interval before backoff kicks in (default: 0.5s)
+  - `semaphore_full_interval` — sleep when all concurrency slots are occupied (default: 1.0s)
+  - `jitter` — toggle random jitter to prevent thundering herd (default: True)
+- New `polling_config` parameter on `Scheduler.__init__` (uses sensible defaults when omitted)
+
+### Changed
+- Job listener now uses exponential backoff instead of fixed sleep intervals
+  - Polls quickly after claiming jobs, backs off gradually when idle, resets on activity
+  - Configurable via `PollingConfig` (previously hardcoded to 0.05s busy / 2.0s idle)
+- Semaphore-full sleep is now configurable via `PollingConfig.semaphore_full_interval` (previously hardcoded to 1.0s)
+- Error recovery sleep in listener now uses `max_interval` instead of a hardcoded 5s
+
+### Migration Notes
+- **Backward Compatible**: Default `PollingConfig` values match the previous hardcoded behavior
+- **No Breaking Changes**: `polling_config` is optional; existing code works without modification
+
 ## [0.2.0] - 2026-02-02
 
 ### Added

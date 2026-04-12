@@ -11,9 +11,9 @@ sys.path.insert(0, os.path.abspath('..'))
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
 project = 'PG Scheduler'
-copyright = '2025, Miguel Rebelo'
+copyright = '2026, Miguel Rebelo'
 author = 'Miguel Rebelo'
-release = '0.2.2'
+release = '0.2.3'
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
@@ -64,7 +64,7 @@ autodoc_default_options = {
 }
 
 # Mock imports for packages not available during documentation build
-autodoc_mock_imports = ['asyncpg']
+autodoc_mock_imports = ['asyncpg', 'croniter']
 
 # Intersphinx mapping
 intersphinx_mapping = {

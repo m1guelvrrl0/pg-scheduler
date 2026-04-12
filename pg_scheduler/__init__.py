@@ -15,10 +15,11 @@ from .conflict_resolution import ConflictResolution
 from .job_priority import JobPriority
 from .job_spec import JobSpec
 from .periodic import periodic
+from .polling import PollingConfig
 from .vacuum import VacuumConfig, VacuumPolicy, VacuumTrigger
 from .scheduler import Scheduler
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 __author__ = "Miguel Rebelo"
 __email__ = "miguel.python.dev@gmail.com"
 
@@ -27,6 +28,7 @@ __all__ = [
     "JobPriority", 
     "JobSpec",
     "ConflictResolution",
+    "PollingConfig",
     "VacuumPolicy",
     "VacuumConfig", 
     "VacuumTrigger",
