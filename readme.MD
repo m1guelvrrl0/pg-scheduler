@@ -262,7 +262,8 @@ MIT — see [LICENSE](LICENSE).
 
 ## Links
 
+- [Documentation](https://pg-scheduler.readthedocs.io/en/latest/)
 - [PyPI](https://pypi.org/project/pg-scheduler/)
 - [GitHub](https://github.com/m1guelvrrl0/pg-scheduler)
 - [Issues](https://github.com/m1guelvrrl0/pg-scheduler/issues)
-- [Changelog](docs/changelog.md)
+- [Changelog](https://pg-scheduler.readthedocs.io/en/latest/changelog.html)

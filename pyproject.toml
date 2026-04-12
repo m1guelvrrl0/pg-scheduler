@@ -70,7 +70,7 @@ examples = [
 
 [project.urls]
 Homepage = "https://github.com/m1guelvrrl0/pg-scheduler"
-Documentation = "https://github.com/m1guelvrrl0/pg-scheduler#readme"
+Documentation = "https://pg-scheduler.readthedocs.io/en/latest/"
 Repository = "https://github.com/m1guelvrrl0/pg-scheduler.git"
 "Bug Tracker" = "https://github.com/m1guelvrrl0/pg-scheduler/issues"
 Changelog = "https://github.com/m1guelvrrl0/pg-scheduler/blob/main/CHANGELOG.md"
