@@ -1,21 +1,17 @@
-# Quick Start Guide
+# Quick Start
 
-This guide will get you up and running with PG Scheduler in minutes.
-
-## Installation
-
-### Requirements
+## Requirements
 
 - Python 3.9+
 - PostgreSQL 12+
 
-### Install PG Scheduler
+## Installation
 
 ```bash
 pip install pg-scheduler
 ```
 
-### Database Setup
+## Database Setup
 
 Create a PostgreSQL database for the scheduler:
 
@@ -25,170 +21,133 @@ CREATE USER scheduler WITH PASSWORD 'scheduler123';
 GRANT ALL PRIVILEGES ON DATABASE scheduler_db TO scheduler;
 ```
 
-The scheduler will automatically create the required tables when it starts.
+The scheduler creates the `scheduled_jobs` table automatically on first start.
 
-## Basic Example
-
-Here's a complete example showing both periodic and manual job scheduling:
+## Standalone Example
 
 ```python
 import asyncio
 import asyncpg
 from datetime import datetime, timedelta, UTC
-from pg_scheduler import Scheduler, periodic, JobPriority
+from pg_scheduler import Scheduler
 
-# Define a periodic job
-@periodic(every=timedelta(minutes=15))
-async def cleanup_temp_files():
-    """Clean up temporary files every 15 minutes"""
-    print("🧹 Cleaning up temporary files...")
-    # Your cleanup logic here
-    await asyncio.sleep(2)  # Simulate work
-    print("✅ Cleanup completed")
-
-# Define a regular job function
-async def send_welcome_email(user_email: str, user_name: str):
-    """Send a welcome email to a new user"""
-    print(f"📧 Sending welcome email to {user_name} ({user_email})")
-    # Your email sending logic here
-    await asyncio.sleep(1)  # Simulate email sending
-    print(f"✅ Welcome email sent to {user_name}")
+async def send_email(recipient: str, subject: str):
+    print(f"Sending email to {recipient}: {subject}")
+    await asyncio.sleep(1)
+    print(f"Email sent to {recipient}")
 
 async def main():
-    # Create database connection pool
     db_pool = await asyncpg.create_pool(
-        user='scheduler',
-        password='scheduler123',
-        database='scheduler_db',
-        host='localhost',
-        port=5432
+        user="scheduler",
+        password="scheduler123",
+        database="scheduler_db",
+        host="localhost",
+        port=5432,
     )
-    
-    # Initialize scheduler
-    scheduler = Scheduler(
-        db_pool=db_pool,
-        max_concurrent_jobs=10,
-        misfire_grace_time=300  # 5 minutes
-    )
-    
-    # Start the scheduler
+
+    scheduler = Scheduler(db_pool=db_pool)
     await scheduler.start()
-    
+
     try:
-        print("🚀 Scheduler started!")
-        
-        # Schedule a welcome email job
         job_id = await scheduler.schedule(
-            send_welcome_email,
-            execution_time=datetime.now(UTC) + timedelta(minutes=1),
-            args=("user@example.com", "John Doe"),
-            priority=JobPriority.NORMAL,
-            max_retries=3
+            send_email,
+            execution_time=datetime.now(UTC) + timedelta(seconds=10),
+            args=("user@example.com", "Welcome!"),
         )
-        
-        print(f"📋 Scheduled welcome email job: {job_id}")
-        
-        # Check periodic jobs
-        periodic_jobs = scheduler.get_periodic_jobs()
-        print(f"📋 Found {len(periodic_jobs)} periodic jobs:")
-        for dedup_key, config in periodic_jobs.items():
-            status = scheduler.get_periodic_job_status(dedup_key)
-            print(f"  • {status['job_name']}: every {status['interval']}s")
-        
-        # Let the scheduler run for a while
-        print("⏱️  Running for 5 minutes... (Ctrl+C to stop)")
-        await asyncio.sleep(300)
-        
-    except KeyboardInterrupt:
-        print("🛑 Shutting down...")
+        print(f"Scheduled job: {job_id}")
+
+        # Keep the process alive so the scheduler can run
+        while True:
+            await asyncio.sleep(1)
     finally:
-        # Graceful shutdown
         await scheduler.shutdown()
         await db_pool.close()
-        print("👋 Goodbye!")
 
 if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-## What Happens
+## FastAPI Example
 
-When you run this example:
+A more realistic setup using FastAPI's lifespan protocol to start and stop the
+scheduler alongside the web application:
 
-1. **Database Setup**: The scheduler creates necessary tables automatically
-2. **Periodic Job Registration**: The `@periodic` decorator registers the cleanup job
-3. **Manual Job Scheduling**: The welcome email is scheduled for 1 minute from now
-4. **Job Execution**: Both jobs will execute at their scheduled times
-5. **Self-Rescheduling**: The periodic job automatically schedules its next run
-6. **Graceful Shutdown**: All active jobs complete before shutdown
+```python
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+
+from fastapi import FastAPI
+import asyncpg
+import asyncio
+import logging
+
+from pg_scheduler import Scheduler, periodic
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+# Periodic tasks are registered at import time via the decorator.
+# The scheduler picks them up automatically when it starts.
+@periodic(every=timedelta(minutes=5))
+async def cleanup_stale_carts():
+    logger.info("Cleaning up stale shopping carts")
+    await asyncio.sleep(0.5)
+    logger.info("Stale carts cleaned")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.db_pool = await asyncpg.create_pool(
+        host="localhost",
+        port=5432,
+        user="scheduler",
+        password="scheduler123",
+        database="scheduler_db",
+    )
+    app.state.scheduler = Scheduler(
+        app.state.db_pool,
+        max_concurrent_jobs=20,
+        misfire_grace_time=120,
+    )
+    await app.state.scheduler.start()
+    yield
+    await app.state.scheduler.shutdown()
+    await app.state.db_pool.close()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+async def process_order(order_id: str, delay: float = 1.0):
+    logger.info(f"Processing order {order_id}")
+    await asyncio.sleep(delay)
+    logger.info(f"Order {order_id} processed")
+
+
+@app.post("/orders/{order_id}/process")
+async def schedule_order(order_id: str):
+    await app.state.scheduler.schedule(
+        process_order,
+        execution_time=datetime.now() + timedelta(seconds=10),
+        args=(order_id,),
+    )
+    return {"status": "scheduled"}
+```
+
+Run it with:
+
+```bash
+pip install pg-scheduler[examples]
+uvicorn myapp:app --host 0.0.0.0 --port 8000
+```
 
 ## Next Steps
 
-- Read the [User Guide](user-guide/index.md) for detailed features
-- Check out more [Examples](examples/index.md)
-- Learn about [Production Deployment](deployment.md)
-- Explore the [API Reference](api/index.md)
-
-## Common Patterns
-
-### Priority Levels
-
-```python
-# Critical priority - executes first
-@periodic(every=timedelta(minutes=5), priority=JobPriority.CRITICAL)
-async def monitor_system():
-    """Critical system monitoring"""
-    pass
-
-# High priority
-@periodic(every=timedelta(minutes=15), priority=JobPriority.HIGH)
-async def important_task():
-    """Important but not critical"""
-    pass
-
-# Normal priority (default)
-@periodic(every=timedelta(hours=1), priority=JobPriority.NORMAL)
-async def regular_task():
-    """Regular background task"""
-    pass
-
-# Low priority - executes last
-@periodic(every=timedelta(hours=6), priority=JobPriority.LOW)
-async def cleanup_task():
-    """Low priority cleanup"""
-    pass
-```
-
-### Jobs with Retries
-
-```python
-@periodic(every=timedelta(hours=1), max_retries=3)
-async def generate_report():
-    """Generate reports with retry on failure"""
-    pass
-```
-
-### Exclusive Jobs (Advisory Locks)
-
-```python
-@periodic(every=timedelta(minutes=30), use_advisory_lock=True)
-async def database_maintenance():
-    """Maintenance that should only run on one worker"""
-    pass
-```
-
-### Manual Job Management
-
-```python
-# Get all periodic jobs
-jobs = scheduler.get_periodic_jobs()
-
-# Disable a job
-scheduler.disable_periodic_job(dedup_key)
-
-# Manually trigger a job
-await scheduler.trigger_periodic_job(dedup_key)
-
-# Check job status
-status = scheduler.get_periodic_job_status(dedup_key)
-```
+- [User Guide](user-guide/index.md) -- configuration, misfire grace time, priorities, conflict resolution.
+- [Performance Tuning](performance.md) -- the knobs that matter and how to size them for your workload.
+- [API Reference](api/index.md) -- full class and function documentation.
+- [Examples](examples/index.md) -- periodic jobs, bulk scheduling, production configuration.

@@ -1,4 +1,4 @@
-include README.md
+include readme.MD
 include LICENSE
 include requirements.txt
 recursive-include docs *.png *.jpg *.gif *.webp
@@ -15,3 +15,4 @@ exclude *_example.py
 exclude test_*.py
 exclude db_monitor.py
 exclude periodic_test_multi_replica.py
+recursive-exclude examples *

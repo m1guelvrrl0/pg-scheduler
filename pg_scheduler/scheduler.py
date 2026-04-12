@@ -15,6 +15,7 @@ from .conflict_resolution import ConflictResolution
 from .job_priority import JobPriority
 from .job_spec import JobSpec, _UNSET as _JOBSPEC_UNSET
 from .periodic import _periodic_registry, PeriodicJobConfig
+from .polling import PollingConfig
 from .vacuum import VacuumConfig, VacuumPolicy, VacuumTrigger
 
 # Sentinel value to distinguish "not specified" from "explicitly None"
@@ -32,26 +33,14 @@ class Scheduler:
     LEASE_DURATION = 60        # 1 minute lease duration (in seconds)
     WORKER_ID_LENGTH = 8       # For worker identification
 
-    # TODO: Add more configuration options
     def __init__(self, 
                  db_pool: asyncpg.Pool, 
                  max_concurrent_jobs: int = 25, 
                  misfire_grace_time: Optional[int] = 300,  # 5 minutes default, None = no expiration
                  vacuum_config: Optional[VacuumConfig] = None,
                  vacuum_enabled: bool = True,
-                 batch_claim_limit: int = 10):
-        """
-        Initialize the Scheduler with concurrency control and reliability features.
-        
-        Args:
-            db_pool: Connection to the PostgreSQL database.
-            max_concurrent_jobs: Maximum number of jobs to run concurrently
-            misfire_grace_time: Default seconds after execution_time before jobs expire.
-                              Set to None for no expiration. Can be overridden per-job.
-            vacuum_config: Configuration for job cleanup policies (uses defaults if None)
-            vacuum_enabled: Whether to enable automatic vacuum cleanup
-            batch_claim_limit: Maximum number of jobs to claim in a single batch (default 10)
-        """
+                 batch_claim_limit: int = 10,
+                 polling_config: Optional[PollingConfig] = None):
         self.db_pool = db_pool
         self.task_map = {}  # Store task functions
         self.is_running = False
@@ -74,6 +63,9 @@ class Scheduler:
         # Vacuum configuration
         self.vacuum_enabled = vacuum_enabled
         self.vacuum_config = vacuum_config or VacuumConfig()
+        
+        # Polling / backoff configuration
+        self.polling_config = polling_config or PollingConfig()
         
         # Background tasks
         self.heartbeat_monitor_task = None
@@ -606,31 +598,28 @@ class Scheduler:
             logger.error(f"Bulk insert failed: {e}")
             raise
 
-    async def listen_for_jobs(self):
-        """Listen for jobs with bulk claiming"""
-        
+    async def listen_for_jobs(self) -> None:
         startup_jitter = random.uniform(0, 1.0)
         await asyncio.sleep(startup_jitter)
         
         logger.debug(f"Starting job listener [worker={self.worker_id}]")
         
+        pc = self.polling_config
+        current_idle_interval = pc.idle_start_interval
+        
         while self.is_running and not self.is_shutting_down:
             try:
-                # Check available semaphore slots
                 available_slots = self.job_semaphore._value
                 if available_slots <= 0:
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(pc.semaphore_full_interval)
                     continue
                 
                 max_claimable = min(available_slots, self.batch_claim_limit)
-                
-                # Claim jobs from database
                 ready_jobs = await self._claim_jobs(max_claimable)
                 
                 if ready_jobs:
                     logger.debug(f"Claimed {len(ready_jobs)} jobs [worker={self.worker_id}] (bulk claiming)")
                     
-                    # The semaphore will naturally limit concurrency
                     for job_row in ready_jobs:
                         if not self.is_running:
                             break
@@ -638,18 +627,26 @@ class Scheduler:
                         self.active_tasks.add(task)
                         task.add_done_callback(self.active_tasks.discard)
                 
-                # Adaptive sleep
-                # TODO: Maybe find a smarter way to do this ie configurableexponential backoff strategy or something
+                # Exponential backoff: fast when busy, backs off when idle
                 if ready_jobs:
-                    jitter = random.uniform(-0.05, 0.05)
-                    await asyncio.sleep(0.05 + jitter)
+                    current_idle_interval = pc.idle_start_interval
+                    sleep_time = pc.min_interval
                 else:
-                    jitter = random.uniform(-0.2, 0.2)
-                    await asyncio.sleep(2.0 + jitter)
+                    sleep_time = current_idle_interval
+                    current_idle_interval = min(
+                        current_idle_interval * pc.backoff_multiplier,
+                        pc.max_interval,
+                    )
+                
+                if pc.jitter:
+                    jitter_range = sleep_time * 0.1
+                    sleep_time += random.uniform(-jitter_range, jitter_range)
+                
+                await asyncio.sleep(max(0, sleep_time))
                     
             except Exception as e:
                 logger.error(f"Error in job listener: {e}")
-                await asyncio.sleep(5)
+                await asyncio.sleep(pc.max_interval)
 
     async def _claim_jobs(self, num_slots: int):
         """Claim jobs from database"""

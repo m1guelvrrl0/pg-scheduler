@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pg-scheduler"
-version = "0.2.2"
+version = "0.2.3"
 description = "A PostgreSQL-based async job scheduler with deduplication, periodic jobs, and reliability features"
 readme = "readme.MD"
 requires-python = ">=3.9"
@@ -70,7 +70,7 @@ examples = [
 
 [project.urls]
 Homepage = "https://github.com/m1guelvrrl0/pg-scheduler"
-Documentation = "https://github.com/m1guelvrrl0/pg-scheduler#readme"
+Documentation = "https://pg-scheduler.readthedocs.io/en/latest/"
 Repository = "https://github.com/m1guelvrrl0/pg-scheduler.git"
 "Bug Tracker" = "https://github.com/m1guelvrrl0/pg-scheduler/issues"
 Changelog = "https://github.com/m1guelvrrl0/pg-scheduler/blob/main/CHANGELOG.md"
@@ -81,7 +81,7 @@ packages = ["pg_scheduler"]
 [tool.hatch.build.targets.sdist]
 include = [
     "/pg_scheduler",
-    "/README.md",
+    "/readme.MD",
     "/LICENSE",
     "/pyproject.toml",
 ]
