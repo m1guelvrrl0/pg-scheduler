@@ -88,8 +88,6 @@ myst_enable_extensions = [
 # Theme options
 html_theme_options = {
     "sidebar_hide_name": False,
-    "light_logo": "logo-light.png",
-    "dark_logo": "logo-dark.png",
     "source_repository": "https://github.com/miguelrebelo/pg-scheduler/",
     "source_branch": "main",
     "source_directory": "docs/",
